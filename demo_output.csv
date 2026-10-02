@@ -1,0 +1,8 @@
+title,fatality,vehicle_type,state,link,rule_confident
+Trailer truck runs over five members of family in Jaipur,Yes,Truck,Rajasthan,https://www.indiatvnews.com/topic/road-accident-1,True
+"8 killed, 24 injured after Haridwar-Indore bus catches fire on Delhi-Mumbai Expressway",Yes (8 dead),Bus / Truck,Rajasthan,https://www.indiatvnews.com/topic/road-accident-2,True
+Sleeper bus collides with Ertiga car near Chityal,Unknown,Bus / Car,Telangana,https://www.indiatvnews.com/topic/road-accident-3,False
+E-rickshaw driver hurt avoiding tractor collision in Badaun,No (injuries only),Auto-rickshaw / E-rickshaw / Tractor,Uttar Pradesh,https://www.indiatvnews.com/topic/road-accident-4,True
+Luxury bus rams into truck near Jarod on Banswara-Surat highway,Unknown,Bus / Truck,Rajasthan,https://www.indiatvnews.com/topic/road-accident-5,False
+20 killed as bus falls into gorge in Uttarakhand,Yes (20 dead),Bus,Uttarakhand,https://www.nbcnews.com/sample-1,True
+16 killed in India road collision in West Bengal,Yes (16 dead),Truck / Jeep,West Bengal,https://www.aljazeera.com/sample-2,True
