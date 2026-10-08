@@ -204,7 +204,7 @@ erDiagram
 
 ## API
 
-Read-only. "Totals" always means the same five numbers: `accidents`, `fatal`, `non_fatal`, `deaths`, `injured`.
+Read-only apart from the fetch trigger. "Totals" always means the same five numbers: `accidents`, `fatal`, `non_fatal`, `deaths`, `injured`.
 
 | Endpoint | Returns |
 |---|---|
@@ -212,6 +212,7 @@ Read-only. "Totals" always means the same five numbers: `accidents`, `fatal`, `n
 | `GET /stats/states` | Totals per state for a day (`?date=`), a month (`?month=`) or all time |
 | `GET /articles` | An article list with its totals, filtered by `date`, `month`, `state` and `severity`, paged with `limit` and `offset` |
 | `GET /health` | `{"status": "ok"}` |
+| `GET /cron/fetch` | Runs one fetch; only for a caller with the `CRON_SECRET` (see "Deployment") |
 
 ## Dashboard
 
@@ -235,7 +236,8 @@ backend/
   extract.py          stages 5 and 6: LLM prompt, fixed lists, cleanup
   store.py            stages 3, 8 and 9: known links, same-event check, insert
   run_pipeline.py     runs the stages end to end
-  api.py              the API
+  api.py              the API, plus the /cron/fetch trigger
+  main.py             entry point for Vercel
   db.py, schema.sql   connection and database schema
   backfill_*.py       one-off scripts that upgraded older rows
   tests/              test suite
@@ -243,7 +245,7 @@ frontend/             the Next.js dashboard
 mock_ui/index.html    the design mockup the dashboard was built from
 PROJECT_SPEC.md       detailed reference: decisions, edge cases, known gaps
 docker-compose.yml    the whole system in containers (see "Running it with Docker")
-render.yaml           an earlier Render deployment plan (see "Deployment")
+render.yaml           an earlier Render deployment plan, not used
 ```
 
 ## Running it with Docker
@@ -321,7 +323,38 @@ From `backend/`:
 
 ## Deployment
 
-Not deployed yet. `render.yaml` describes an earlier plan (Render for the database, API and a daily cron job, Vercel for the dashboard). Hosting everything on Vercel with a daily trigger for the pipeline is being considered instead.
+Live at **https://accident-news-phi.vercel.app** (API: https://accident-news-api.vercel.app).
+
+```mermaid
+flowchart LR
+    USER(["Visitor"]) --> FE["Vercel project: accident-news<br/>frontend/ · Next.js"]
+    FE -->|API_URL| BE["Vercel project: accident-news-api<br/>backend/ · FastAPI"]
+    BE -->|DATABASE_URL| DB[("Neon Postgres")]
+    CRON["Vercel Cron<br/>3 times a day"] -->|"GET /cron/fetch<br/>+ CRON_SECRET"| BE
+```
+
+| Part | Where | Notes |
+|---|---|---|
+| Dashboard | Vercel project `accident-news`, from `frontend/` | `API_URL` points at the API |
+| API | Vercel project `accident-news-api`, from `backend/` | `backend/main.py` is the entry point Vercel looks for |
+| Database | Neon Postgres, added through the Vercel Marketplace | Its connection settings are injected into the API project |
+| Fetch job | The API's `GET /cron/fetch`, called by Vercel Cron | Schedule in `backend/vercel.json` |
+
+**How the fetch runs on Vercel.** Vercel has no long-running jobs: a scheduler calls a URL and the work must finish inside that request, which the free plan ends at 300 seconds. So:
+
+- `/cron/fetch` runs the same pipeline as `run_pipeline.py`, but stops starting new articles after 240 seconds. What it stored is kept; the rest is reported as `deferred`.
+- It is scheduled three times a day (06:00, 12:00 and 18:00 UTC, each up to an hour late on the free plan). Every run skips what is already stored or turned down, so a later run finishes what an earlier one deferred.
+- The endpoint only answers a caller that sends the project's `CRON_SECRET`, which Vercel Cron does automatically.
+
+**Day-to-day commands**, run from `backend/` or `frontend/` with the Vercel CLI:
+
+```bash
+vercel deploy --prod              # ship the current folder to production
+vercel crons run /cron/fetch      # trigger a fetch now (from backend/)
+vercel logs --environment production -q "cron_fetch"   # each run's outcome counts
+```
+
+Deploys are made from the command line; the projects are not connected to GitHub, so a push does not redeploy. `render.yaml` describes an earlier Render plan and is not used.
 
 ## Known limitations
 

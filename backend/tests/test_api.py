@@ -263,3 +263,51 @@ def test_allowed_origin_gets_cors_header(client, monkeypatch):
     assert response.headers["access-control-allow-origin"] == origin
     other = client.get("/health", headers={"Origin": "https://evil.example"})
     assert "access-control-allow-origin" not in other.headers
+
+
+# --- /cron/fetch ----------------------------------------------------------
+
+@pytest.fixture
+def fetch_job(monkeypatch):
+    """Stub the pipeline so the endpoint can be called without the network."""
+    import fetch
+    import run_pipeline
+
+    calls = {}
+
+    def run(conn, articles, deadline=None, **kwargs):
+        calls["articles"] = articles
+        calls["deadline"] = deadline
+        return run_pipeline.Counter(fetched=len(articles), inserted=1, deferred=1)
+
+    monkeypatch.setenv("CRON_SECRET", "s3cret-for-tests")
+    monkeypatch.setattr(fetch, "fetch_articles", lambda: [{"title": "a"}, {"title": "b"}])
+    monkeypatch.setattr(run_pipeline, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": "s3cret-for-tests"}])
+def test_fetch_job_refuses_callers_without_the_secret(client, fetch_job, headers):
+    assert client.get("/cron/fetch", headers=headers).status_code == 401
+    assert fetch_job == {}
+
+
+def test_fetch_job_is_closed_when_no_secret_is_configured(client, fetch_job, monkeypatch):
+    monkeypatch.delenv("CRON_SECRET")
+    assert client.get("/cron/fetch", headers={"Authorization": "Bearer "}).status_code == 401
+    assert fetch_job == {}
+
+
+def test_fetch_job_runs_the_pipeline_with_a_deadline_and_reports_counts(client, fetch_job):
+    response = client.get("/cron/fetch", headers={"Authorization": "Bearer s3cret-for-tests"})
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["fetched"], body["inserted"], body["deferred"], body["error"]) == (2, 1, 1, 0)
+    assert len(fetch_job["articles"]) == 2
+    assert fetch_job["deadline"] is not None
+
+
+def test_fetch_job_reports_an_empty_feed_as_a_failure(client, fetch_job, monkeypatch):
+    import fetch
+    monkeypatch.setattr(fetch, "fetch_articles", lambda: [])
+    assert client.get("/cron/fetch", headers={"Authorization": "Bearer s3cret-for-tests"}).status_code == 502

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "fastapi",
+  "crons": [
+    { "path": "/cron/fetch", "schedule": "0 6 * * *" },
+    { "path": "/cron/fetch", "schedule": "0 12 * * *" },
+    { "path": "/cron/fetch", "schedule": "0 18 * * *" }
+  ]
+}

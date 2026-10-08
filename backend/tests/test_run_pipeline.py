@@ -297,3 +297,25 @@ def test_dry_run_remembers_nothing(conn, pipeline):
     pipeline["fields"] = extracted(is_india_traffic_accident=False)
     run(conn, [raw()], dry_run=True)
     assert seen(conn) == []
+
+
+# --- deadline -------------------------------------------------------------
+
+def test_articles_past_the_deadline_are_deferred_and_not_remembered(conn, pipeline, monkeypatch):
+    pipeline["fields"] = extracted(is_india_traffic_accident=False)
+    batch = [raw(link=GOOGLE_LINK + str(i), title=f"Story {i}") for i in range(3)]
+    monkeypatch.setattr(run_pipeline, "resolve_url", lambda link: link.replace(GOOGLE_LINK, "https://example.com/"))
+
+    counts = run(conn, batch, workers=1, deadline=time.monotonic() - 1)
+
+    assert counts["deferred"] == 3
+    assert counts["rejected-not-india"] == 0
+    assert rows(conn) == []
+    # Nothing was decided about them, so the next run must look again.
+    assert conn.execute("SELECT count(*) FROM seen_links").fetchone()[0] == 0
+
+
+def test_a_deadline_in_the_future_changes_nothing(conn, pipeline):
+    counts = run(conn, [raw()], deadline=time.monotonic() + 60)
+    assert counts["inserted"] == 1
+    assert counts["deferred"] == 0

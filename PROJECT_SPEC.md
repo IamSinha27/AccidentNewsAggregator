@@ -15,7 +15,9 @@ A daily-refreshing dashboard of Indian road-accident news. Once a day the pipeli
 | API | Built: totals per day and per state, and article lists by day, month and state (see §10) |
 | Frontend | Built from the mockup in `mock_ui/index.html`: overview, day view and state view (see §10) |
 
-**Not yet done:** deploying these changes, and a check of the phone layout.
+**Deployed** on Vercel (dashboard and API) with a Neon database; see §12.
+
+**Not yet done:** a check of the phone layout.
 
 ## 3. Architecture
 
@@ -46,6 +48,8 @@ backend/
   store.py              dedup + insert; memory of turned-down links
   run_pipeline.py       cron entrypoint that strings the steps together
   api.py                FastAPI app
+  main.py               entry point for Vercel (re-exports the app)
+  vercel.json           Vercel: framework and the fetch schedule
   db.py                 connection + schema bootstrap
   schema.sql            tables, constraints, and upgrades of older tables
   backfill_injured.py   one-off: fill injured for rows that predate the column
@@ -85,7 +89,7 @@ python run_pipeline.py [--dry-run] [--limit N] [--workers N]
 
 Steps 2, 4 and 5 are network-bound and run on a thread pool (8 workers by default). Everything that touches the database stays on one thread, in feed order, because the same-event check depends on which article was stored first.
 
-Each article ends with exactly one outcome: `inserted`, `duplicate`, `same-event`, `rejected-not-india`, `rejected-not-recent`, `extraction-failed` or `error`. One bad article never aborts the run. The exit code is non-zero only if the database is unreachable or the RSS fetch returns nothing.
+Each article ends with exactly one outcome: `inserted`, `duplicate`, `same-event`, `rejected-not-india`, `rejected-not-recent`, `extraction-failed` or `error`. A run given a deadline (`run(..., deadline=)`, used by `/cron/fetch`) also counts `deferred`: articles it did not reach in time, about which nothing is remembered, so the next run takes them. One bad article never aborts the run. The exit code is non-zero only if the database is unreachable or the RSS fetch returns nothing.
 
 `--dry-run` goes through every step inside one transaction and rolls it back.
 
@@ -227,6 +231,7 @@ Read-only FastAPI app. CORS origins come from the `CORS_ORIGINS` environment var
 | `GET /articles` | An article list with its totals, for a day, a month and/or a state |
 | `GET /dates` | Days that have data, newest first. Superseded by `/stats/daily`; no longer used by the frontend |
 | `GET /health` | `{"status": "ok"}` |
+| `GET /cron/fetch` | Runs one fetch inside the request and returns the outcome counts. Requires `Authorization: Bearer $CRON_SECRET` |
 
 "Totals" always means the same five numbers: `accidents`, `fatal`, `non_fatal`, `deaths`, `injured`.
 
@@ -333,7 +338,16 @@ From `frontend/`, set `API_URL` (see `.env.example`) and run `npm run dev`.
 
 **In containers.** `docker compose up --build` starts three services: `db`, `backend` and `frontend`. The fetch job is part of the backend service: `docker compose exec backend python run_pipeline.py` runs it inside the running backend container, using `OPENAI_API_KEY` from `backend/.env`. `frontend/Dockerfile` builds the dashboard's standalone production server. The README has the details.
 
-**Deployed.** `render.yaml` defines the Postgres database, the API web service and the cron job (`python run_pipeline.py` at 18:00 UTC). Secrets set by hand on Render: `OPENAI_API_KEY` on the cron job, `CORS_ORIGINS` on the API. The frontend deploys to Vercel with root directory `frontend/` and `API_URL` pointing at the Render API.
+**Deployed (Vercel + Neon).** Live at https://accident-news-phi.vercel.app, API at https://accident-news-api.vercel.app.
+
+- **Two Vercel projects** on the Hobby plan, deployed from the command line (`vercel deploy --prod` in each folder): `accident-news` from `frontend/` and `accident-news-api` from `backend/`. Neither is connected to GitHub.
+- **Each folder has a `vercel.json` naming its framework** (`nextjs`, `fastapi`). The projects were created empty, so Vercel did not detect it.
+- **`backend/main.py`** re-exports the app from `api.py`; Vercel only looks for a FastAPI app in a few fixed file names. A `pyproject.toml` entry point was tried first and failed the build, because Vercel then expects a full `[project]` table.
+- **`backend/.vercelignore`** keeps `.env`, `.venv` and the tests out of the upload. The repo's root `.gitignore` does not apply when deploying from a subfolder.
+- **Database:** Neon Postgres (`accident-news-db`, US East), added through the Vercel Marketplace, which injects `DATABASE_URL` and related variables into the API project. Seeded on 9 Oct 2026 with the 536 local articles and the remembered links.
+- **Secrets in the API project:** `OPENAI_API_KEY` and `CRON_SECRET`. The frontend project has `API_URL`.
+- **Fetch job:** Vercel Cron calls `GET /cron/fetch` at 06:00, 12:00 and 18:00 UTC (each up to an hour late on Hobby). Hobby allows each cron entry once a day and ends a request at 300 seconds, so the endpoint stops starting articles after 240 seconds (`FETCH_BUDGET_SECONDS`) and the three runs cover for each other. `vercel crons run /cron/fetch` triggers one by hand.
+- `render.yaml` is from an earlier Render plan and is unused.
 
 **Environment gotchas:**
 

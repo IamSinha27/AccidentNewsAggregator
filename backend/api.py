@@ -1,6 +1,7 @@
 """
 api.py
-Read-only HTTP API over the articles table, for the Next.js frontend.
+HTTP API over the articles table, for the Next.js frontend. Read-only apart
+from /cron/fetch, which runs the pipeline for hosts that trigger it by URL.
 
     uvicorn api:app
 
@@ -10,15 +11,19 @@ GET /articles       article list + totals for a day, a month and/or a state
                     (default: latest day with data); ?severity= ?limit= ?offset=
 GET /dates          days that have data, newest first (superseded by /stats/daily)
 GET /health
+GET /cron/fetch     run one fetch; needs "Authorization: Bearer $CRON_SECRET"
 """
 
 import datetime
+import hmac
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import db
@@ -35,6 +40,10 @@ TOTALS_SQL = """count(*),
 TOTALS_KEYS = ("accidents", "fatal", "non_fatal", "deaths", "injured")
 
 ARTICLE_KEYS = ("id", "date", "title", "severity", "deaths", "injured", "vehicles", "state", "link", "source")
+
+# How long /cron/fetch keeps starting new articles. Vercel ends a request at
+# 300 seconds; stopping at 240 leaves room for the articles already in flight.
+FETCH_BUDGET_SECONDS = 240
 
 DATE_PARAM = Query(None, alias="date", description="YYYY-MM-DD")
 MONTH_PARAM = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="YYYY-MM; not together with date")
@@ -182,3 +191,31 @@ def articles(
         "totals": totals,
         "articles": [dict(zip(ARTICLE_KEYS, row)) for row in rows],
     }
+
+
+@app.get("/cron/fetch")
+def cron_fetch(authorization: Optional[str] = Header(None), conn: psycopg.Connection = Depends(get_conn)):
+    """Run the pipeline once, inside this request. Meant for a scheduler that
+    calls a URL (Vercel Cron sends the CRON_SECRET as a bearer token). Safe to
+    call again: stored and turned-down links are skipped, and whatever a run
+    doesn't reach in time is left for the next one."""
+    secret = os.environ.get("CRON_SECRET")
+    if not secret or not hmac.compare_digest(authorization or "", f"Bearer {secret}"):
+        raise HTTPException(401, "missing or wrong cron secret")
+    deadline = time.monotonic() + FETCH_BUDGET_SECONDS
+
+    # Imported here so that ordinary API requests don't pay for loading the
+    # scraping and LLM libraries on a cold start.
+    import run_pipeline
+    from fetch import fetch_articles
+
+    # One line per HTTP request would bury the per-article outcomes in the log.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    articles = fetch_articles()
+    if not articles:
+        raise HTTPException(502, "RSS fetch returned no articles")
+    counts = run_pipeline.run(conn, articles, deadline=deadline)
+    summary = {name: counts[name] for name in run_pipeline.OUTCOMES}
+    print(f"cron_fetch: {summary}", flush=True)
+    return summary

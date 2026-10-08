@@ -11,6 +11,7 @@ database is unreachable or the RSS fetch came back empty.
 
 import argparse
 import sys
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
@@ -40,7 +41,7 @@ DEFAULT_WORKERS = 8
 # Order the summary is printed in.
 OUTCOMES = [
     "fetched", "duplicate", "rejected-not-india", "rejected-not-recent",
-    "extraction-failed", "error", "same-event", "inserted",
+    "extraction-failed", "error", "same-event", "inserted", "deferred",
 ]
 
 
@@ -97,7 +98,7 @@ def _decide(conn: psycopg.Connection, article: dict, link: str, fields: Optional
 
 
 def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: Optional[int] = None,
-        workers: int = DEFAULT_WORKERS) -> Counter:
+        workers: int = DEFAULT_WORKERS, deadline: Optional[float] = None) -> Counter:
     """Process the articles and return a count per outcome.
 
     The slow part of each article is network I/O (decode the redirect, scrape
@@ -109,7 +110,12 @@ def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: 
     dry_run: nothing is committed. The whole batch runs in one transaction
     that is rolled back at the end, so the reported decisions (including
     same-event discards between articles in the same batch) match what a
-    real run would do."""
+    real run would do.
+
+    deadline: a time.monotonic() value after which no further article is
+    started. For hosts that cut a run off after a fixed time: what has been
+    stored stays stored, and the rest is counted as 'deferred' -- nothing is
+    remembered about those links, so the next run picks them up."""
     if limit is not None:
         articles = articles[:limit]
     counts = Counter(fetched=len(articles))
@@ -127,7 +133,8 @@ def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: 
     if not dry_run:
         conn.commit()
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         # A redirect that won't decode isn't a reason to drop the article:
         # fall back to the Google link and to title-only extraction.
         resolved_links = list(pool.map(resolve_url, [a["link"] for a in articles]))
@@ -152,7 +159,11 @@ def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: 
             seen.add(link)
             pending.append((article, resolved, link))
 
+        handled = 0
         for (article, _resolved, link), (fields, error) in zip(pending, pool.map(_scrape_and_extract, pending)):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            handled += 1
             if error is not None:
                 fail(article, error)
                 continue
@@ -164,6 +175,11 @@ def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: 
                 fail(article, e)
                 continue
             record(article, outcome)
+        if handled < len(pending):
+            counts["deferred"] = len(pending) - handled
+    finally:
+        # Past the deadline, articles still queued are dropped, not waited for.
+        pool.shutdown(wait=True, cancel_futures=True)
 
     if dry_run:
         conn.rollback()
