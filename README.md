@@ -346,15 +346,16 @@ flowchart LR
 - It is scheduled three times a day (06:00, 12:00 and 18:00 UTC, each up to an hour late on the free plan). Every run skips what is already stored or turned down, so a later run finishes what an earlier one deferred.
 - The endpoint only answers a caller that sends the project's `CRON_SECRET`, which Vercel Cron does automatically.
 
-**Day-to-day commands**, run from `backend/` or `frontend/` with the Vercel CLI:
+**Deploying.** Both Vercel projects are connected to this repository, each building its own folder (`frontend/` and `backend/`). A push to `main` deploys both to production; a push to any other branch creates preview deployments.
+
+**Day-to-day commands**, run from `backend/` with the Vercel CLI:
 
 ```bash
-vercel deploy --prod              # ship the current folder to production
-vercel crons run /cron/fetch      # trigger a fetch now (from backend/)
+vercel crons run /cron/fetch      # trigger a fetch now
 vercel logs --environment production -q "cron_fetch"   # each run's outcome counts
 ```
 
-Deploys are made from the command line; the projects are not connected to GitHub, so a push does not redeploy. `render.yaml` describes an earlier Render plan and is not used.
+`render.yaml` describes an earlier Render plan and is not used.
 
 ## Known limitations
 

@@ -340,10 +340,10 @@ From `frontend/`, set `API_URL` (see `.env.example`) and run `npm run dev`.
 
 **Deployed (Vercel + Neon).** Live at https://accident-news-phi.vercel.app, API at https://accident-news-api.vercel.app.
 
-- **Two Vercel projects** on the Hobby plan, deployed from the command line (`vercel deploy --prod` in each folder): `accident-news` from `frontend/` and `accident-news-api` from `backend/`. Neither is connected to GitHub.
+- **Two Vercel projects** on the Hobby plan, both connected to the GitHub repository: `accident-news` with root directory `frontend/` and `accident-news-api` with root directory `backend/`. A push to `main` deploys both to production; other branches get preview deployments.
 - **Each folder has a `vercel.json` naming its framework** (`nextjs`, `fastapi`). The projects were created empty, so Vercel did not detect it.
 - **`backend/main.py`** re-exports the app from `api.py`; Vercel only looks for a FastAPI app in a few fixed file names. A `pyproject.toml` entry point was tried first and failed the build, because Vercel then expects a full `[project]` table.
-- **`backend/.vercelignore`** keeps `.env`, `.venv` and the tests out of the upload. The repo's root `.gitignore` does not apply when deploying from a subfolder.
+- **`backend/.vercelignore`** keeps `.env`, `.venv` and the tests out of a deployment made with the CLI from that folder, where the repo's root `.gitignore` does not apply. Deployments from GitHub only ever contain committed files.
 - **Database:** Neon Postgres (`accident-news-db`, US East), added through the Vercel Marketplace, which injects `DATABASE_URL` and related variables into the API project. Seeded on 9 Oct 2026 with the 536 local articles and the remembered links.
 - **Secrets in the API project:** `OPENAI_API_KEY` and `CRON_SECRET`. The frontend project has `API_URL`.
 - **Fetch job:** Vercel Cron calls `GET /cron/fetch` at 06:00, 12:00 and 18:00 UTC (each up to an hour late on Hobby). Hobby allows each cron entry once a day and ends a request at 300 seconds, so the endpoint stops starting articles after 240 seconds (`FETCH_BUDGET_SECONDS`) and the three runs cover for each other. `vercel crons run /cron/fetch` triggers one by hand.
