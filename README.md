@@ -54,20 +54,20 @@ This is the heart of the project. Each article goes through the stages below and
 
 ```mermaid
 flowchart TD
-    A["1. Fetch<br/>37 Google News queries"] --> B["2. Resolve<br/>Google link → publisher URL"]
-    B --> C{"3. Seen this<br/>link before?"}
+    A["1 · Fetch<br/>37 Google News queries"] --> B["2 · Resolve<br/>Google link → publisher URL"]
+    B --> C{"3 · Seen this<br/>link before?"}
     C -->|yes| O1(["duplicate"])
-    C -->|no| D["4. Scrape<br/>article body text"]
-    D --> E["5. Extract<br/>one LLM call"]
+    C -->|no| D["4 · Scrape<br/>article body text"]
+    D --> E["5 · Extract<br/>one LLM call"]
     E -->|no usable answer| O2(["extraction-failed"])
-    E --> F["6. Clean up<br/>the LLM's answer"]
-    F --> G{"7a. A road accident<br/>in India?"}
+    E --> F["6 · Clean up<br/>the LLM's answer"]
+    F --> G{"7a · A road accident<br/>in India?"}
     G -->|no| O3(["rejected-not-india"])
-    G -->|yes| H{"7b. Did it happen in<br/>the last 24–48 hours?"}
+    G -->|yes| H{"7b · Did it happen in<br/>the last 24–48 hours?"}
     H -->|no| O4(["rejected-not-recent"])
-    H -->|yes| I{"8. Same accident<br/>already stored?"}
+    H -->|yes| I{"8 · Same accident<br/>already stored?"}
     I -->|yes| O5(["same-event"])
-    I -->|no| J["9. Insert"]
+    I -->|no| J["9 · Insert"]
     J --> O6(["inserted"])
 ```
 
