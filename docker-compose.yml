@@ -1,11 +1,11 @@
-# The whole system in containers: database, API, dashboard, and the pipeline.
+# The whole system in three containers: database, backend and frontend.
 #
-#   docker compose up --build        start the database, API and dashboard
-#   docker compose run --rm pipeline fetch the last day's articles (needs OPENAI_API_KEY)
-#   docker compose down              stop everything (add -v to also delete the data)
+#   docker compose up --build                              start everything
+#   docker compose exec backend python run_pipeline.py     fetch the last day's articles
+#   docker compose down                                    stop (add -v to also delete the data)
 #
 # Dashboard: http://localhost:3000    API: http://localhost:8000
-# Change the host ports with WEB_PORT / API_PORT if those are taken.
+# Change the host ports with FRONTEND_PORT / BACKEND_PORT if those are taken.
 
 services:
   db:
@@ -21,48 +21,43 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    # Not published to the host: only the other containers talk to it.
+    # Not published to the host: only the backend talks to it.
 
-  api:
+  # Serves the API. The fetch job is part of this service too: it is run
+  # inside this container with `docker compose exec` (see the top of this file).
+  backend:
     build: ./backend
+    # OPENAI_API_KEY for the fetch job comes from here. The file is optional:
+    # without it the API still works and only the fetch fails.
+    env_file:
+      - path: backend/.env
+        required: false
+    # These win over anything in that file, which points at a local database.
     environment:
       DATABASE_URL: postgresql://accident_news:${POSTGRES_PASSWORD:-accident_news}@db:5432/accident_news
       # The dashboard calls the API from its own server, not from the browser,
       # so this only matters if you call the API from a page yourself.
-      CORS_ORIGINS: http://localhost:${WEB_PORT:-3000}
+      CORS_ORIGINS: http://localhost:${FRONTEND_PORT:-3000}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 6
 
-  web:
+  frontend:
     build: ./frontend
     environment:
-      API_URL: http://api:8000
+      API_URL: http://backend:8000
     depends_on:
-      api:
+      backend:
         condition: service_healthy
     ports:
-      - "${WEB_PORT:-3000}:3000"
-
-  # Not started by `docker compose up`: it does one fetch and exits.
-  pipeline:
-    build: ./backend
-    command: ["python", "run_pipeline.py"]
-    profiles: ["pipeline"]
-    environment:
-      DATABASE_URL: postgresql://accident_news:${POSTGRES_PASSWORD:-accident_news}@db:5432/accident_news
-      # Taken from your shell, or from a .env file next to this one.
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    depends_on:
-      db:
-        condition: service_healthy
+      - "${FRONTEND_PORT:-3000}:3000"
 
 volumes:
   db_data:

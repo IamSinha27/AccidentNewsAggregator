@@ -1,5 +1,5 @@
-# One image for both backend programs: the API (the default command) and the
-# pipeline (docker compose runs it with `python run_pipeline.py`).
+# The backend: the container runs the API, and the fetch job is run inside it
+# on demand with `python run_pipeline.py`.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

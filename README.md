@@ -250,38 +250,39 @@ render.yaml           an earlier Render deployment plan (see "Deployment")
 
 The quickest way to see the whole system. You need Docker, and an OpenAI API key for the fetch.
 
-```bash
-docker compose up --build        # database, API and dashboard
-```
-
-The dashboard is at http://localhost:3000 and the API at http://localhost:8000. The database starts empty, so the dashboard says "No articles yet" until the pipeline has run:
+Put the key in `backend/.env` (copy `backend/.env.example` and set `OPENAI_API_KEY`), then:
 
 ```bash
-OPENAI_API_KEY=sk-... docker compose run --rm pipeline
+docker compose up --build
 ```
 
-That does one fetch of the last 24 hours and exits. Add `python run_pipeline.py --dry-run --limit 10` to the end to try it without storing anything. If your key is already in `backend/.env`, use `docker compose --env-file backend/.env run --rm pipeline` instead.
+The dashboard is at http://localhost:3000 and the API at http://localhost:8000. The database starts empty, so the dashboard says "No articles yet" until a fetch has run. With the containers up, run one from another terminal:
+
+```bash
+docker compose exec backend python run_pipeline.py
+```
+
+That fetches the last 24 hours inside the backend container and exits. Add `--dry-run --limit 10` to try it without storing anything.
 
 ```mermaid
 flowchart LR
     subgraph compose["docker compose"]
-        WEB["web<br/>Next.js :3000"] --> API["api<br/>FastAPI :8000"]
-        API --> DB[("db<br/>Postgres 16")]
-        PIPE["pipeline<br/>runs on demand"] --> DB
+        FE["frontend<br/>Next.js :3000"] --> BE["backend<br/>API :8000<br/>+ fetch job on demand"]
+        BE --> DB[("db<br/>Postgres 16")]
     end
-    YOU(["Browser"]) --> WEB
+    YOU(["Browser"]) --> FE
 ```
 
-| Service | What it is | Started by `up`? |
-|---|---|---|
-| `db` | Postgres 16; data kept in the `db_data` volume | Yes |
-| `api` | The backend image running the API | Yes |
-| `web` | The dashboard's production build | Yes |
-| `pipeline` | The same backend image running one fetch | No, only with `run` |
+| Service | What it is |
+|---|---|
+| `db` | Postgres 16; data kept in the `db_data` volume |
+| `backend` | Serves the API. The fetch job runs in the same container when you start it with `exec` |
+| `frontend` | The dashboard's production build |
 
-- If port 3000 or 8000 is taken: `WEB_PORT=3010 API_PORT=8010 docker compose up`.
+- If port 3000 or 8000 is taken: `FRONTEND_PORT=3010 BACKEND_PORT=8010 docker compose up`.
 - `docker compose down` stops everything and keeps the data; `docker compose down -v` deletes it too.
-- The database is not published to your machine; only the other containers reach it.
+- The database is not published to your machine; only the backend reaches it.
+- `backend/.env` is optional. Without it the API and dashboard still work, and only the fetch fails.
 
 ## Running it without Docker
 
