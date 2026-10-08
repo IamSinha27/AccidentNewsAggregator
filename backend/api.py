@@ -209,13 +209,14 @@ def cron_fetch(authorization: Optional[str] = Header(None), conn: psycopg.Connec
     import run_pipeline
     from fetch import fetch_articles
 
-    # One line per HTTP request would bury the per-article outcomes in the log.
+    # Vercel keeps about 250 log lines per request. A line per HTTP request
+    # or per article would push the summary below out of the log.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     articles = fetch_articles()
     if not articles:
         raise HTTPException(502, "RSS fetch returned no articles")
-    counts = run_pipeline.run(conn, articles, deadline=deadline)
+    counts = run_pipeline.run(conn, articles, deadline=deadline, quiet=True)
     summary = {name: counts[name] for name in run_pipeline.OUTCOMES}
     print(f"cron_fetch: {summary}", flush=True)
     return summary

@@ -319,3 +319,9 @@ def test_a_deadline_in_the_future_changes_nothing(conn, pipeline):
     counts = run(conn, [raw()], deadline=time.monotonic() + 60)
     assert counts["inserted"] == 1
     assert counts["deferred"] == 0
+
+
+def test_quiet_run_prints_no_line_per_article(conn, pipeline, capsys):
+    counts = run(conn, [raw()], quiet=True)
+    assert counts["inserted"] == 1
+    assert "[inserted]" not in capsys.readouterr().out

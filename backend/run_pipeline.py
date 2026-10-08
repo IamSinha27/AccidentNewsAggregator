@@ -98,7 +98,7 @@ def _decide(conn: psycopg.Connection, article: dict, link: str, fields: Optional
 
 
 def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: Optional[int] = None,
-        workers: int = DEFAULT_WORKERS, deadline: Optional[float] = None) -> Counter:
+        workers: int = DEFAULT_WORKERS, deadline: Optional[float] = None, quiet: bool = False) -> Counter:
     """Process the articles and return a count per outcome.
 
     The slow part of each article is network I/O (decode the redirect, scrape
@@ -115,14 +115,18 @@ def run(conn: psycopg.Connection, articles: list, dry_run: bool = False, limit: 
     deadline: a time.monotonic() value after which no further article is
     started. For hosts that cut a run off after a fixed time: what has been
     stored stays stored, and the rest is counted as 'deferred' -- nothing is
-    remembered about those links, so the next run picks them up."""
+    remembered about those links, so the next run picks them up.
+
+    quiet: don't print a line per article (failures are still reported). For
+    hosts that keep only a limited number of log lines per run."""
     if limit is not None:
         articles = articles[:limit]
     counts = Counter(fetched=len(articles))
 
     def record(article, outcome):
         counts[outcome] += 1
-        print(f"[{outcome}] {article.get('title', '')}", flush=True)
+        if not quiet:
+            print(f"[{outcome}] {article.get('title', '')}", flush=True)
 
     def fail(article, e):
         conn.rollback()
