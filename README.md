@@ -242,10 +242,48 @@ backend/
 frontend/             the Next.js dashboard
 mock_ui/index.html    the design mockup the dashboard was built from
 PROJECT_SPEC.md       detailed reference: decisions, edge cases, known gaps
+docker-compose.yml    the whole system in containers (see "Running it with Docker")
 render.yaml           an earlier Render deployment plan (see "Deployment")
 ```
 
-## Running it locally
+## Running it with Docker
+
+The quickest way to see the whole system. You need Docker, and an OpenAI API key for the fetch.
+
+```bash
+docker compose up --build        # database, API and dashboard
+```
+
+The dashboard is at http://localhost:3000 and the API at http://localhost:8000. The database starts empty, so the dashboard says "No articles yet" until the pipeline has run:
+
+```bash
+OPENAI_API_KEY=sk-... docker compose run --rm pipeline
+```
+
+That does one fetch of the last 24 hours and exits. Add `python run_pipeline.py --dry-run --limit 10` to the end to try it without storing anything. If your key is already in `backend/.env`, use `docker compose --env-file backend/.env run --rm pipeline` instead.
+
+```mermaid
+flowchart LR
+    subgraph compose["docker compose"]
+        WEB["web<br/>Next.js :3000"] --> API["api<br/>FastAPI :8000"]
+        API --> DB[("db<br/>Postgres 16")]
+        PIPE["pipeline<br/>runs on demand"] --> DB
+    end
+    YOU(["Browser"]) --> WEB
+```
+
+| Service | What it is | Started by `up`? |
+|---|---|---|
+| `db` | Postgres 16; data kept in the `db_data` volume | Yes |
+| `api` | The backend image running the API | Yes |
+| `web` | The dashboard's production build | Yes |
+| `pipeline` | The same backend image running one fetch | No, only with `run` |
+
+- If port 3000 or 8000 is taken: `WEB_PORT=3010 API_PORT=8010 docker compose up`.
+- `docker compose down` stops everything and keeps the data; `docker compose down -v` deletes it too.
+- The database is not published to your machine; only the other containers reach it.
+
+## Running it without Docker
 
 You need Python 3.12, Node 20, a local Postgres, and an OpenAI API key.
 

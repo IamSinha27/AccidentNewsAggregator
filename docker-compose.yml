@@ -1,0 +1,68 @@
+# The whole system in containers: database, API, dashboard, and the pipeline.
+#
+#   docker compose up --build        start the database, API and dashboard
+#   docker compose run --rm pipeline fetch the last day's articles (needs OPENAI_API_KEY)
+#   docker compose down              stop everything (add -v to also delete the data)
+#
+# Dashboard: http://localhost:3000    API: http://localhost:8000
+# Change the host ports with WEB_PORT / API_PORT if those are taken.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: accident_news
+      POSTGRES_USER: accident_news
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-accident_news}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accident_news -d accident_news"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not published to the host: only the other containers talk to it.
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://accident_news:${POSTGRES_PASSWORD:-accident_news}@db:5432/accident_news
+      # The dashboard calls the API from its own server, not from the browser,
+      # so this only matters if you call the API from a page yourself.
+      CORS_ORIGINS: http://localhost:${WEB_PORT:-3000}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  web:
+    build: ./frontend
+    environment:
+      API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+
+  # Not started by `docker compose up`: it does one fetch and exits.
+  pipeline:
+    build: ./backend
+    command: ["python", "run_pipeline.py"]
+    profiles: ["pipeline"]
+    environment:
+      DATABASE_URL: postgresql://accident_news:${POSTGRES_PASSWORD:-accident_news}@db:5432/accident_news
+      # Taken from your shell, or from a .env file next to this one.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:

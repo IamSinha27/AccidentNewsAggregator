@@ -53,6 +53,7 @@ backend/
   tests/                pytest suite (see §11)
 frontend/               Next.js 16 app: the dashboard (see §10)
 mock_ui/index.html      the design mockup the UI was built from (a bundled export; open in a browser)
+docker-compose.yml      database, API, dashboard and an on-demand pipeline, as containers
 render.yaml             Render blueprint: Postgres, API web service, cron job
 backups/                local pg_dump files taken before schema changes (untracked)
 ```
@@ -330,11 +331,14 @@ uvicorn api:app                               # the API on :8000
 
 From `frontend/`, set `API_URL` (see `.env.example`) and run `npm run dev`.
 
+**In containers.** `docker compose up --build` starts Postgres, the API and the dashboard; `docker compose run --rm pipeline` does one fetch (it needs `OPENAI_API_KEY`). `backend/Dockerfile` builds one image used for both the API and the pipeline; `frontend/Dockerfile` builds the dashboard's standalone production server. The README has the details.
+
 **Deployed.** `render.yaml` defines the Postgres database, the API web service and the cron job (`python run_pipeline.py` at 18:00 UTC). Secrets set by hand on Render: `OPENAI_API_KEY` on the cron job, `CORS_ORIGINS` on the API. The frontend deploys to Vercel with root directory `frontend/` and `API_URL` pointing at the Render API.
 
 **Environment gotchas:**
 
 - `googlenewsdecoder` and `trafilatura` need unrestricted outbound network access.
+- `googlenewsdecoder` 0.2.1 breaks with `selectolax` 1.0, which a fresh install picks by default; `requirements.txt` pins `selectolax` to 0.4.13.
 - `load_dotenv()` does not override a variable already exported in the shell, so a stale exported key wins over `.env`.
 - Render's free Postgres expires 30 days after creation.
 
