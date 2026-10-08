@@ -1,420 +1,359 @@
-# Indian Traffic Accident News Aggregator — Build Spec
+# Indian Traffic Accident News Aggregator
+
+Describes the system as built. Last updated 8 October 2026.
 
 ## 1. Goal
 
-A daily-refreshing dashboard that aggregates Indian traffic/road-accident news.
+A daily-refreshing dashboard of Indian road-accident news. Once a day the pipeline collects that day's articles, an LLM pulls structured fields out of each one, and the result is stored in Postgres and shown on a web page.
 
-Every day, aggregate news articles covering traffic accidents in India. For each day, show a table of all qualifying articles with these columns:
+## 2. Status
 
-| Title | Fatality | Vehicle type | State | Article link |
-|---|---|---|---|---|
+| Part | State |
+|---|---|
+| Pipeline (fetch → resolve → scrape → extract → dedup → store) | Built and tested |
+| Database schema | Built; reworked on 8 Oct 2026 (see §8) |
+| API | Built: totals per day and per state, and article lists by day, month and state (see §10) |
+| Frontend | Built from the mockup in `mock_ui/index.html`: overview, day view and state view (see §10) |
 
-The user can change the date via a date picker and view the table for that date. On first visit (no date selected), the dashboard shows the **most recent date that has data** — not strictly "today" — so it's never an empty table if the daily cron hasn't run yet that day.
+**Not yet done:** deploying these changes, and a check of the phone layout.
 
-**Table is exactly these 5 columns, Title first.** No injury count. `source` is stored in the DB but not displayed as its own column.
-
-## 2. Architecture
+## 3. Architecture
 
 ```
-Daily cron (Render) 
-  → fetch Google News RSS (last 24h, India-scoped keyword search)
-  → for each article:
-      resolve Google's redirect link → real publisher URL
-      scrape publisher URL → clean article body text
-      send to LLM (OpenAI gpt-4o-mini) → structured fields + relevance/recency flags
-      filter out anything not a real, recent India traffic accident
-      dedup against existing DB rows (exact link match, and same-event-different-outlet match)
-      insert (or merge into existing row)
+Daily cron (Render, 18:00 UTC = 23:30 IST)
+  → fetch Google News RSS, one query per state/UT plus "India" (last 24h)
+  → resolve each Google redirect link → real publisher URL
+  → skip links already stored or already turned down
+  → scrape the publisher page → article body text
+  → LLM (OpenAI gpt-4o-mini) → relevance flags + structured fields
+  → drop anything that isn't a recent Indian road accident
+  → drop a second report of an accident that is already stored
+  → insert
   → Postgres (Render)
   ↕
-FastAPI backend (Render) — serves /articles?date=YYYY-MM-DD and "most recent date with data"
+FastAPI backend (Render), read-only
   ↕
-Next.js frontend (Vercel) — date picker + table
+Next.js frontend (Vercel)
 ```
 
-Deployment target: **Vercel** (frontend), **Render** (Postgres + backend API + the daily cron job).
+## 4. Repository layout
 
-## 3. Data source: Google News RSS
+```
+backend/
+  fetch.py              Google News RSS → raw candidate articles
+  fetch_body.py         resolve Google redirect; scrape article body
+  extract.py            LLM prompt, the fixed lists, cleanup of the LLM's answer
+  store.py              dedup + insert; memory of turned-down links
+  run_pipeline.py       cron entrypoint that strings the steps together
+  api.py                FastAPI app
+  db.py                 connection + schema bootstrap
+  schema.sql            tables, constraints, and upgrades of older tables
+  backfill_injured.py   one-off: fill injured for rows that predate the column
+  backfill_vehicles.py  one-off: convert old free-text vehicle_type, then drop it
+  tests/                pytest suite (see §11)
+frontend/               Next.js 16 app: the dashboard (see §10)
+mock_ui/index.html      the design mockup the UI was built from (a bundled export; open in a browser)
+render.yaml             Render blueprint: Postgres, API web service, cron job
+backups/                local pg_dump files taken before schema changes (untracked)
+```
 
-Endpoint: `https://news.google.com/rss/search`
+## 5. Data source: Google News RSS
 
-Query params:
-- `q` — search terms. Supports basic boolean (`AND`/`OR`), `site:`, and `when:` (recency filter, e.g. `when:1d`).
-- `hl` — interface language, e.g. `en-IN`.
-- `gl` — country bias, e.g. `IN`.
-- `ceid` — combined edition id, `country:language`, e.g. `IN:en`.
+Endpoint: `https://news.google.com/rss/search`, with `q` (search terms, supports `AND`/`OR` and `when:1d`), `hl=en-IN`, `gl=IN`, `ceid=IN:en`.
 
-**Important, confirmed-by-testing caveats:**
-- `gl`/`ceid`/`hl` are a **bias**, not a geo filter. Live testing repeatedly returned non-India stories (Iran, Nepal, Kyrgyzstan, Afghanistan, US local news) in a feed scoped to `gl=IN&ceid=IN:en`. **Do not rely on these params for geo-filtering** — that's what the LLM's `is_india_traffic_accident` field is for (see §5).
-- The RSS `link` field is **not** the real article URL — it's an opaque Google redirect (`news.google.com/rss/articles/CBMi...`) that must be resolved separately (see §4, step 2).
-- The RSS `summary`/snippet field is usually just an HTML-wrapped duplicate of the title, not real excerpt text. Don't rely on it for extraction when body text is available — only use it as a last-resort fallback if scraping fails.
+Things learned by testing, all still true:
 
-Recency filter: `when:1d` is applied on every fetch, matched to a daily cron cadence. This filters by **Google's indexed/published time**, not necessarily the time the accident happened — that distinction is handled separately by the LLM's `is_recent_accident` field.
+- **`gl`/`ceid`/`hl` are a bias, not a geo filter.** An unscoped query returns mostly non-India stories. The fetch therefore runs the accident query once per state/UT, with the name as a required phrase, plus once for "India": 37 requests per run. Results are merged and de-duplicated. The states can't be OR-ed into one query, because Google ignores terms past a length limit, which silently drops the `when:` filter.
+- **Relevance is still judged by the LLM**, not by the fetch (§7).
+- **The RSS `link` is a Google redirect**, not the article URL. It has to be resolved separately.
+- **The RSS snippet is usually just the title again.** It is only a fallback when scraping fails.
+- **`when:1d` filters by when Google indexed the article**, not when the accident happened. The LLM's `is_recent_accident` flag handles that difference.
 
-## 4. Pipeline steps (already built and tested — see §9 for full code)
+## 6. Pipeline (`run_pipeline.py`)
 
-### Step 1 — Fetch (`fetch.py`)
-Builds the RSS URL and parses it with `feedparser`. Returns raw candidate articles (title, Google redirect link, published date, source, snippet). **Does no filtering** — every article is passed downstream for the LLM to judge. Tested live: works correctly, reproduces the known `gl=IN` bias issue described above.
+```
+python run_pipeline.py [--dry-run] [--limit N] [--workers N]
+```
 
-### Step 2 — Resolve redirect (`fetch_body.py::resolve_url`)
-Uses the `googlenewsdecoder` PyPI package to turn the Google redirect link into the real publisher URL. This requires a live round-trip to Google's servers (the old base64-offline-decode trick no longer works — Google changed the token format). Returns `None` on failure rather than raising.
+1. **Fetch** (`fetch.py`): returns raw candidates: title, Google link, published time, source, snippet. No filtering.
+2. **Resolve** (`fetch_body.resolve_url`): the `googlenewsdecoder` package turns the redirect into the publisher URL. Needs a live round-trip to Google. On failure the article is kept, with the Google link and title-only extraction.
+3. **Skip known links** (`store.link_known`): a link that is already stored, or was turned down in the last 7 days (`seen_links`), is counted as `duplicate` before any scrape or LLM call, so reruns cost nothing.
+4. **Scrape** (`fetch_body.get_article_text`): `trafilatura` extracts clean body text, capped at 3000 characters. Returns nothing on a paywall, block or dead link.
+5. **Extract** (`extract.extract_fields`): one LLM call per article (§7).
+6. **Decide and store** (`store.save_article`): relevance check, dedup, insert (§9).
 
-### Step 3 — Scrape body (`fetch_body.py::get_article_text`)
-Uses `trafilatura` to fetch the resolved URL and extract clean body text (strips nav/ads/boilerplate). Returns `None` on failure (paywall, bot-block, dead link) rather than raising. Capped at 3000 chars by default.
+Steps 2, 4 and 5 are network-bound and run on a thread pool (8 workers by default). Everything that touches the database stays on one thread, in feed order, because the same-event check depends on which article was stored first.
 
-Both steps 2 and 3 require real outbound network access — they will not work in a network-sandboxed CI environment. (This was validated on a real unrestricted network — see §10.)
+Each article ends with exactly one outcome: `inserted`, `duplicate`, `same-event`, `rejected-not-india`, `rejected-not-recent`, `extraction-failed` or `error`. One bad article never aborts the run. The exit code is non-zero only if the database is unreachable or the RSS fetch returns nothing.
 
-### Step 4 — Extract (`extract.py::extract_fields`)
-One LLM call per article (OpenAI `gpt-4o-mini`) that both judges relevance/recency **and** extracts the structured fields in a single pass — see §5 for the exact schema and reasoning.
+`--dry-run` goes through every step inside one transaction and rolls it back.
 
-## 5. LLM extraction: schema, prompt, and reasoning
+## 7. LLM extraction (`extract.py`)
 
-**Why a single LLM call instead of regex/keyword rules:** regex is brittle, requires constant hardcoded maintenance (keyword lists, city→state mappings), and — critically — gives no reliable confidence signal: a rule can match the wrong word and report "confident" anyway, silently producing wrong data with no way to detect the error. An LLM call per article is simpler, more accurate, and cheap enough at this volume.
+One call to `gpt-4o-mini` per article both judges relevance and extracts the fields.
 
-**Required output schema** (JSON, exactly these 5 keys):
+**Why an LLM and not regex rules:** rules are brittle, need constant maintenance (keyword lists, city-to-state tables), and give no reliable confidence signal. A rule can match the wrong word and still report success.
+
+**The model returns JSON with exactly these seven keys:**
 
 ```json
 {
   "is_india_traffic_accident": true,
   "is_recent_accident": true,
-  "fatality": "Yes (3 dead)",
-  "vehicle_type": "Car",
+  "severity": "fatal",
+  "deaths": 3,
+  "injured": 5,
+  "vehicles": ["Car", "Truck"],
   "state": "Uttar Pradesh"
 }
 ```
 
-- `is_india_traffic_accident` (bool) — false if this is not an Indian road/traffic accident at all (wrong country, or not a traffic accident — e.g. a stock market "crash", an app "crash").
-- `is_recent_accident` (bool) — **true only if the accident itself occurred roughly within the last 24–48 hours** and is the actual news. **false** if the accident happened much earlier (weeks/months/years ago) and the article is really about something else that happened *around* it more recently — a court verdict, a compensation award, an arrest, an appeal, an anniversary retrospective, a policy response, etc. Rule of thumb for the model: look at what the headline is actually announcing — a court awarding money over a "2018 crash" is news about the court, not about a crash that just happened. **This was validated live**: correctly returned `false` for a tribunal-compensation article about a 2018 crash, and `true` for a same-day crash report.
-- `fatality` — one of `"Yes (N dead)"` (fill in the number if stated), `"Yes"` (fatal, no count given), `"No (injuries only)"`, or `"Unknown"`.
-- `vehicle_type` — the vehicle(s) involved, e.g. `"Bus"`, `"Truck / Car"`, `"Two-wheeler"`, `"Auto-rickshaw"`, `"Pedestrian (no vehicle specified)"`, or `"Unknown"`.
-- `state` — the Indian state the accident occurred in (infer from a named city/district if the state isn't stated directly). **Must exactly match** one of the full names in the reference list below — never abbreviate, never invent a spelling variant. `"Unknown"` if it truly can't be determined.
+| Key | Meaning |
+|---|---|
+| `is_india_traffic_accident` | False for another country, or for something that isn't a road accident (a stock market "crash") |
+| `is_recent_accident` | True only if the accident itself happened in roughly the last 24–48 hours. False for an old accident back in the news through a verdict, compensation award, arrest or anniversary |
+| `severity` | `"fatal"` if the article says at least one person died. Otherwise `"non-fatal"`, which covers both "nobody died" and "the article doesn't say" |
+| `deaths` | Number killed. 0 if nobody died or no number is given |
+| `injured` | Number injured, not counting the dead. 0 if nobody was injured or no number is given |
+| `vehicles` | List of the vehicle types involved, from the fixed list below. Empty if none is known |
+| `state` | A name from the fixed list below, or `"Unknown"` |
 
-Reference list of Indian states/UTs (passed into every prompt, for the model to disambiguate a city/district into its state):
+An article is stored only if both flags are true.
 
-```
-Andhra Pradesh, Arunachal Pradesh, Assam, Bihar, Chhattisgarh, Goa, Gujarat,
-Haryana, Himachal Pradesh, Jharkhand, Karnataka, Kerala, Madhya Pradesh,
-Maharashtra, Manipur, Meghalaya, Mizoram, Nagaland, Odisha, Punjab, Rajasthan,
-Sikkim, Tamil Nadu, Telangana, Tripura, Uttar Pradesh, Uttarakhand, West Bengal,
-Delhi, Jammu and Kashmir, Ladakh, Puducherry, Chandigarh
-```
+**Fixed lists** (both defined in `extract.py` and inserted into the prompt):
 
-**Filtering rule:** only pass an article through to the database if **both** `is_india_traffic_accident` AND `is_recent_accident` are `true`. Anything real-but-historical (old accident resurfacing via court/legal/anniversary coverage) is discarded at extraction time and never reaches the DB.
+- `VEHICLE_TYPES`, 7 names: Auto-rickshaw, Bus, Car, Tractor, Truck, Two-wheeler, Van.
+- `INDIAN_STATES_UTS`, 36 names: the 28 states and 8 union territories.
 
-**Known edge case, accepted as-is (not fixed):** an article can occasionally report on **more than one accident** (observed once in live testing — an ANI piece bundled an Agra crash with an unrelated Delhi hit-and-run in the same story). The current design extracts one accident's worth of fields per article and does not split compound articles into multiple rows. Revisit only if this turns out to be common in practice, not a one-off.
+**Who does what for vehicles:**
 
-**Model behavior notes from live testing:**
-- The model sometimes wraps its JSON response in markdown fences (```json ... ```) despite being told not to — code must strip these (see `extract.py`'s regex cleanup).
-- `max_tokens` should be generous enough (400, not 200) that a stray preamble before the JSON doesn't get truncated mid-object and break parsing.
-- Every failure path (`None` return) should log *why* to stderr — API error, JSON parse failure (with the raw text), or missing keys — rather than silently returning `None` with no diagnostic. A batch run with silent `None`s is undebuggable after the fact. This is already implemented.
+- The **LLM** translates real-world wording into the seven categories. The prompt gives hints: motorcycle/scooter/bike → Two-wheeler; SUV/MUV/jeep → Car; lorry/dumper/tanker/trailer/container → Truck; pickup/tempo/ambulance/school van → Van; e-rickshaw → Auto-rickshaw; tractor-trolley → Tractor; mini-bus/school bus → Bus. Anything that fits none (a train, a pedestrian) is left out.
+- The **code** does not translate. `normalise_vehicles` only keeps names that are in the list (ignoring capitalisation), removes repeats and sorts alphabetically. An out-of-list name is dropped, not converted.
 
-## 6. Date semantics
+**Cleanup of the counts** (`normalise_casualties`): a stated death toll always makes the article fatal; any severity other than "fatal" becomes "non-fatal"; a count that isn't a plain number ("several", null) becomes 0.
 
-The `date` stored for each article is the article's **published** date, not the accident's occurrence date. This is a deliberate choice: using occurrence date risks a late-reported accident silently populating an already-viewed/past date in the dashboard. Published date is always "today" (or very close to it, given the `when:1d` + `is_recent_accident` filters), which is what the daily-aggregation UX actually wants.
+**Model behaviour to know about:**
 
-## 7. Deduplication
+- It sometimes wraps the JSON in markdown fences despite being told not to; the code strips them.
+- `max_tokens` is 400 so a stray preamble can't truncate the JSON.
+- Every failure path logs its reason to stderr (API error, unparseable JSON with the raw text, missing keys) and returns nothing; the pipeline counts it as `extraction-failed` and will retry it on the next run.
 
-Two distinct dedup problems, both necessary for "daily aggregation" to actually work over time:
-
-1. **Exact duplicate** — the same article being processed twice (e.g. a cron rerun, or the same URL appearing in two query variants). Handled by a `UNIQUE` constraint on the resolved article link in Postgres, with `INSERT ... ON CONFLICT (link) DO NOTHING`.
-2. **Same real-world event, different outlet** — multiple outlets covering the same accident. Handled by checking existing rows for the same `date + state + vehicle_type`, with `fatality` compared loosely (e.g. within ±1 of the stated death count, since outlets sometimes disagree slightly early in coverage) rather than requiring an exact string match. If a match is found, **append** the new outlet/link into that row's `sources` JSONB column instead of inserting a new row. If no match, insert a new row.
-
-This heuristic is accepted as imperfect (could over-merge two unrelated accidents in the same state/vehicle-type on a busy day, or under-merge if district naming differs) but is good enough for this use case.
-
-## 8. Database schema (Postgres)
+## 8. Database (`schema.sql`)
 
 ```sql
 CREATE TABLE articles (
-    id SERIAL PRIMARY KEY,
-    date DATE NOT NULL,                  -- article's published date, not occurrence date
-    title TEXT NOT NULL,
-    link TEXT UNIQUE NOT NULL,            -- the RESOLVED publisher URL, not the Google redirect
-    source TEXT,                          -- primary outlet name
-    sources JSONB DEFAULT '[]'::jsonb,    -- additional outlets covering the same event: [{"source": "...", "link": "..."}]
-    fatality TEXT,
-    vehicle_type TEXT,
-    state TEXT,
-    created_at TIMESTAMPTZ DEFAULT now()
+    id          SERIAL PRIMARY KEY,
+    date        DATE NOT NULL,           -- published date in IST, not the accident date
+    title       TEXT NOT NULL,
+    link        TEXT UNIQUE NOT NULL,    -- resolved publisher URL
+    source      TEXT,                    -- outlet name
+    severity    TEXT NOT NULL,           -- 'fatal' | 'non-fatal'
+    deaths      INT NOT NULL DEFAULT 0,
+    injured     INT NOT NULL DEFAULT 0,
+    vehicles    TEXT[] NOT NULL DEFAULT '{}',
+    state       TEXT,
+    created_at  TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX idx_articles_date ON articles (date);
-CREATE INDEX idx_articles_date_state_vehicle ON articles (date, state, vehicle_type);  -- for the dedup lookup in §7
+CREATE TABLE seen_links (                -- links looked at and turned down
+    link     TEXT PRIMARY KEY,
+    outcome  TEXT NOT NULL,
+    seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
-Notes:
-- `id` is a surrogate key deliberately, not `link` — because the dedup/merge design needs to append additional source links to an existing row, and `link` alone can't serve as a stable identity for a merged multi-outlet event.
-- `link` stores the **resolved** publisher URL (post step-2), not the raw Google redirect — the redirect is useless to an end user clicking through from the dashboard.
-- `title` **is shown** in the dashboard table (first column — see §1). `source` is stored for debugging/context but is not shown as its own column.
+Indexes: `articles (date)`, `articles (date, state)` for the dedup lookup, `articles (state, date)` for one state's article list, `seen_links (seen_at)` for pruning.
 
-## 9. Existing code (already written and live-tested — build on this, don't rewrite from scratch)
+**Rules the database enforces:**
 
-All of the following has been tested against live Google News RSS data, real publisher sites, and the real OpenAI API (not mocked). Dependencies: `feedparser`, `googlenewsdecoder`, `trafilatura`, `openai`, `python-dotenv`.
+- `severity` is `'fatal'` or `'non-fatal'`.
+- `deaths` and `injured` are not negative.
+- `deaths` is 0 unless `severity` is `'fatal'`.
+- `vehicles` contains only the seven names. This list is repeated from `extract.VEHICLE_TYPES`; adding a category means changing both, and altering the constraint on existing databases.
 
-**Known environment gotchas hit during testing** (worth being aware of when deploying):
-- `googlenewsdecoder` and `trafilatura` need real, unrestricted outbound network access — they will fail (connection errors) behind a restrictive egress allowlist/proxy. Fine on Render; just something to know if testing inside a sandboxed CI step.
-- Python 3.9 doesn't support the `str | None` union-type syntax (needs 3.10+) — use `typing.Optional[str]` instead if targeting 3.9.
-- When testing with environment variables, remember `python-dotenv`'s `load_dotenv()` does **not** override an already-exported shell variable by default — a stale exported key will silently win over a freshly-edited `.env` file.
+**How to read the values:**
 
-### `fetch.py`
+| Value | Meaning | Suggested display |
+|---|---|---|
+| `fatal`, `deaths = 3` | Three stated dead | Fatal · 3 dead |
+| `fatal`, `deaths = 0` | Fatal, toll not stated | Fatal · toll unknown |
+| `non-fatal` | No one died, or unclear | Non-fatal |
+| `injured = 0` | Nobody hurt, or no number stated; the two can't be told apart | Show no injury text |
+| `vehicles = {}` | No known vehicle | Unknown |
+| `state = 'Unknown'` | Could not be determined | Excluded from the map |
 
-```python
-"""
-fetch.py
-Pulls candidate articles from Google News RSS (India-scoped keyword search).
-Relevance/geo-filtering is NOT done here -- that's handled entirely by the
-LLM call in extract.py (is_india_traffic_accident / is_recent_accident), so
-every fetched article gets passed on as a raw candidate for the LLM to judge.
-"""
+The words "Unknown" and the " / " between vehicles are added by the UI. The database stores neither for vehicles.
 
-import feedparser
-from urllib.parse import quote
+**Upgrading an older database.** `schema.sql` is run on every API start and pipeline run (`db.init_schema`) and upgrades older tables in place:
 
-RSS_BASE = "https://news.google.com/rss/search"
+- A table with the old free-text `fatality` column gets `severity` and `deaths` derived from it by SQL, and `fatality` is dropped.
+- A table with the old free-text `vehicle_type` column gets an empty `vehicles` column. The old column stays until `backfill_vehicles.py` is run.
 
-# Keywords that indicate a genuine traffic/road accident story
-ACCIDENT_QUERY = '(accident OR crash OR collision OR "hit and run") AND (road OR highway OR bus OR truck OR car OR bike OR vehicle)'
+Two one-off scripts then fill what SQL can't. Neither scrapes anything.
 
+- `python backfill_vehicles.py`: splits each stored description into individual vehicle names, asks the LLM for the category of each distinct name, writes `vehicles`, drops `vehicle_type`.
+- `python backfill_injured.py`: asks the LLM for an injured count from the stored headline only. Rows whose headline doesn't state one stay at 0.
 
-def build_rss_url(query: str = ACCIDENT_QUERY, country: str = "IN", lang: str = "en", when: str = "1d") -> str:
-    """when: Google's own recency filter, e.g. '1h', '1d', '7d'. Appended
-    directly into the query string. Set to None/"" to disable."""
-    full_query = f"{query} when:{when}" if when else query
-    q = quote(full_query)
-    return f"{RSS_BASE}?q={q}&hl={lang}-{country}&gl={country}&ceid={country}:{lang}"
+Both have been run on the local database. A deployed database needs each run once.
 
+## 9. Deduplication (`store.py`)
 
-def fetch_articles(query: str = ACCIDENT_QUERY, country: str = "IN", lang: str = "en", when: str = "1d"):
-    """Fetch and parse the RSS feed. Returns list of dicts, unfiltered --
-    pass each one to extract.extract_fields() to judge relevance/recency and
-    pull structured fields.
+Two separate problems:
 
-    when: Google's recency filter (default '1d' for a daily cron run).
-    Filters by when Google indexed/published the article, not necessarily
-    when the accident occurred -- that distinction is handled by the LLM's
-    is_recent_accident field, not here."""
-    url = build_rss_url(query, country, lang, when)
-    feed = feedparser.parse(url)
-    articles = []
-    for entry in feed.entries:
-        articles.append({
-            "title": entry.get("title", ""),
-            "link": entry.get("link", ""),
-            "published": entry.get("published", ""),
-            "source": entry.get("source", {}).get("title", "") if entry.get("source") else "",
-            "snippet": entry.get("summary", ""),
-        })
-    return articles
+1. **The same article again** (a cron rerun, or one URL returned by two regional queries). Caught by the link check: the URL is already in `articles` or `seen_links`. Backed by the `UNIQUE` constraint on `link`.
+2. **The same accident from another outlet.** An existing row counts as the same event if all of these hold:
+   - same `date` and same `state` (never applied when the state is "Unknown");
+   - the same set of `vehicles`;
+   - the same `severity`;
+   - a compatible death toll: within 1 of each other, or either one not stated.
+
+   The later article is discarded and the first one stored stays. One link per accident is enough. Its URL goes into `seen_links` so later runs skip it.
+
+`injured` is deliberately not compared: injury counts differ too much between outlets.
+
+The same-event match is a heuristic and accepted as imperfect. It can discard an unrelated accident with the same state and vehicles on a busy day, including two unrelated accidents that both have no known vehicle. It can let the same accident through twice when outlets name different vehicle types.
+
+`seen_links` is pruned after 7 days; the feed only reaches back one day, so older links never return.
+
+## 10. API (`api.py`) and frontend
+
+Read-only FastAPI app. CORS origins come from the `CORS_ORIGINS` environment variable.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /stats/daily` | Totals for every day that has data, oldest first |
+| `GET /stats/states` | Totals per state for a day, a month or all time |
+| `GET /articles` | An article list with its totals, for a day, a month and/or a state |
+| `GET /dates` | Days that have data, newest first. Superseded by `/stats/daily`; no longer used by the frontend |
+| `GET /health` | `{"status": "ok"}` |
+
+"Totals" always means the same five numbers: `accidents`, `fatal`, `non_fatal`, `deaths`, `injured`.
+
+**`GET /stats/daily`** takes no parameters. About 365 rows a year, so the UI fetches it once and derives month totals, day-on-day changes, the month and day pickers and previous/next day from it.
+
+```json
+{
+  "first_date": "2026-10-01",
+  "latest_date": "2026-10-07",
+  "days": [{"date": "2026-10-01", "accidents": 45, "fatal": 30, "non_fatal": 15, "deaths": 70, "injured": 90}]
+}
 ```
 
-### `fetch_body.py`
+**`GET /stats/states`** takes `?date=YYYY-MM-DD` or `?month=YYYY-MM` (not both); with neither it covers all time. `states` lists only states with at least one accident, most accidents first. Accidents with no known state can't go on the map and are reported separately in `unknown`.
 
-```python
-"""
-fetch_body.py
-Two-step enrichment for each article, before it goes to extract.py:
-
-1. resolve_url()      -- decode Google's redirect link into the real publisher URL
-2. get_article_text() -- fetch that real URL and pull clean body text (no
-   ads/nav/boilerplate) for the LLM to actually read, instead of just the
-   thin headline-only snippet Google's RSS gives us.
-
-Both steps hit the network per article and can fail for reasons outside
-our control (paywalls, bot-blocking, slow/dead redirect tokens, publisher
-sites that don't want scraping). Every function here degrades gracefully
--- returns None on failure rather than raising -- so the pipeline can fall
-back to headline-only extraction rather than dropping the article entirely.
-"""
-
-from typing import Optional
-from googlenewsdecoder import gnewsdecoder
-import trafilatura
-
-REQUEST_TIMEOUT = 10  # seconds, per network call
-
-
-def resolve_url(google_link: str) -> Optional[str]:
-    """Decode a news.google.com/rss/articles/... redirect link into the
-    real publisher URL. Returns None if decoding fails."""
-    try:
-        result = gnewsdecoder(google_link, interval=1)
-        if result.get("status"):
-            return result["decoded_url"]
-        return None
-    except Exception:
-        return None
-
-
-def get_article_text(url: str, max_chars: int = 3000) -> Optional[str]:
-    """Fetch a URL and extract clean article body text. Returns None if
-    the fetch or extraction fails (paywall, block, dead link, etc)."""
-    try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return None
-        text = trafilatura.extract(downloaded)
-        if not text:
-            return None
-        return text[:max_chars]
-    except Exception:
-        return None
-
-
-def enrich_article(article: dict) -> dict:
-    """Takes a raw article dict from fetch.py (has 'link' = Google redirect
-    URL) and adds 'resolved_link' and 'body_text' keys. Both may be None
-    if resolution/scraping failed -- caller should fall back to
-    title+snippet extraction in that case, not skip the article."""
-    resolved = resolve_url(article["link"])
-    body_text = get_article_text(resolved) if resolved else None
-    return {
-        **article,
-        "resolved_link": resolved,
-        "body_text": body_text,
-    }
+```json
+{
+  "date": null,
+  "month": "2026-10",
+  "states": [{"state": "Maharashtra", "accidents": 60, "fatal": 37, "non_fatal": 23, "deaths": 125, "injured": 339}],
+  "unknown": {"accidents": 10, "fatal": 6, "non_fatal": 4, "deaths": 9, "injured": 12}
+}
 ```
 
-### `extract.py`
+**`GET /articles`** parameters, all optional:
 
-**Note:** the `is_recent_accident` wording below has been tightened to the 24–48 hour framing per the latest design decision. The "last few days" wording was what was actually live-tested (and worked correctly on both test cases in §10) — the 24–48h tightening is a wording-only change in the same spirit and has not been separately re-tested, but should behave the same or better given it's a narrower, more explicit version of the same instruction. Worth a quick sanity check after deploying.
+| Parameter | Meaning |
+|---|---|
+| `date` | One day |
+| `month` | `YYYY-MM`; not together with `date` |
+| `state` | A name from `INDIAN_STATES_UTS`, or `Unknown`. On its own it means all time for that state |
+| `severity` | `fatal` or `non-fatal`. Narrows the list only, not `totals` |
+| `limit`, `offset` | Paging. Default limit 50, maximum 500 |
 
-```python
-"""
-extract.py
-LLM-based extraction of structured fields (fatality, vehicle_type, state)
-from traffic-accident news article text (title + snippet/body).
+With no `date`, `month` or `state`, it returns the latest day that has data.
 
-Regex/keyword rules were deliberately dropped: they're brittle, need
-constant hardcoded maintenance (keyword lists, city->state mappings), and
-worst of all give no reliable confidence signal -- a rule can match the
-wrong word and report "confident" anyway, silently producing wrong data
-with no way to know it happened. An LLM call per article is simpler,
-more accurate, and cheap enough at this volume (a few cents/day at most).
-"""
-
-import os
-import re
-import sys
-import json
-from typing import Optional
-
-# Reference list passed into the prompt to help the model disambiguate
-# a city/district name into its state -- data for the model to use,
-# not a matching mechanism we rely on ourselves.
-INDIAN_STATES_UTS = [
-    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
-    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
-    "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
-    "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim",
-    "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand",
-    "West Bengal", "Delhi", "Jammu and Kashmir", "Ladakh", "Puducherry",
-    "Chandigarh",
-]
-
-EXTRACTION_PROMPT = """You are extracting structured data from an Indian traffic accident news article for a tracking database.
-
-Title: {title}
-Article text: {body}
-
-Reference list of Indian states/UTs (use this to infer a state from a city or district name if the state itself isn't mentioned): {states}
-
-Return ONLY valid JSON, no other text, no markdown fences, with exactly these keys:
-- "is_india_traffic_accident": true or false -- false if this is not an Indian road/traffic accident (e.g. it's about a different country, or not a traffic accident at all -- stock market "crash", app "crash", etc.)
-- "is_recent_accident": true or false -- true only if the accident itself occurred roughly within the last 24-48 hours and is the actual news. false if the accident happened much earlier (weeks, months, years ago) and the article is actually about something else that happened *around* it more recently -- a court verdict, compensation award, an arrest, an appeal, an anniversary retrospective, a policy response, etc. When in doubt, look at what the headline is actually announcing: a court awarding money over a "2018 crash" is news about the court, not about a crash that just happened.
-- "fatality": one of "Yes (N dead)" (fill in the actual number if stated), "Yes" (fatal but no count given), "No (injuries only)", or "Unknown"
-- "vehicle_type": the vehicle(s) involved, e.g. "Bus", "Truck / Car", "Two-wheeler", "Auto-rickshaw", "Pedestrian (no vehicle specified)", or "Unknown"
-- "state": the Indian state the accident occurred in, inferring from a named city/district if needed. You MUST return the state's full name EXACTLY as it appears in the reference list above (e.g. "Uttar Pradesh", not "UP" or "Uttar pradesh") -- or "Unknown" if it truly can't be determined. Never abbreviate, never invent a spelling variant.
-"""
-
-
-def extract_fields(title: str, snippet: str = "", body_text: Optional[str] = None):
-    """Single LLM call per article. Returns a dict with the five keys above.
-
-    body_text: full article text from fetch_body.get_article_text(), if
-    available -- gives the model much more to work with than the headline
-    alone (Google's RSS snippet is usually just a duplicate of the title,
-    not real excerpt text). Falls back to title+snippet when body_text is
-    None (scrape failed, paywalled, etc) so the pipeline still produces a
-    best-effort result rather than skipping the article.
-
-    Returns None if OPENAI_API_KEY isn't set, the API call itself fails
-    (network, rate limit, auth), or the response can't be parsed into the
-    expected shape. Every None path prints a one-line diagnostic to stderr
-    first -- including the raw model output when parsing is what failed --
-    so a None in a batch run is debuggable after the fact instead of being
-    indistinguishable from every other None. Caller should treat None as
-    'needs manual review', not silently skip it."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print(f"extract_fields: OPENAI_API_KEY not set, skipping '{title[:60]}'", file=sys.stderr)
-        return None
-
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-
-    body = body_text if body_text else (snippet or "(no article text available -- title only)")
-
-    prompt = EXTRACTION_PROMPT.format(
-        title=title,
-        body=body,
-        states=", ".join(INDIAN_STATES_UTS),
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as e:
-        # Broad on purpose: network errors, rate limits, auth failures, etc.
-        # all land here -- a bad article shouldn't crash a whole batch run,
-        # but we still want the reason on record, not just a silent None.
-        print(f"extract_fields: API call failed for '{title[:60]}': {e}", file=sys.stderr)
-        return None
-
-    raw = resp.choices[0].message.content.strip()
-    cleaned = re.sub(r"^```json|```$", "", raw, flags=re.MULTILINE).strip()
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print(f"extract_fields: JSON parse failed for '{title[:60]}': {e}", file=sys.stderr)
-        print(f"  raw model output was: {raw!r}", file=sys.stderr)
-        return None
-
-    required_keys = {"is_india_traffic_accident", "is_recent_accident", "fatality", "vehicle_type", "state"}
-    if not required_keys.issubset(data.keys()):
-        print(f"extract_fields: missing keys for '{title[:60]}': got {list(data.keys())}", file=sys.stderr)
-        return None
-
-    return data
+```json
+{
+  "date": "2026-10-07",
+  "latest_date": "2026-10-07",
+  "totals": {"accidents": 56, "fatal": 30, "non_fatal": 26, "deaths": 83, "injured": 86},
+  "articles": [{"id": 495, "date": "2026-10-07", "title": "...", "severity": "fatal", "deaths": 1, "injured": 4,
+                "vehicles": ["Car"], "state": "Andhra Pradesh", "link": "...", "source": "The Hindu"}]
+}
 ```
 
-## 10. What's been validated live (and what hasn't)
+- `totals` covers the whole date/month/state scope and ignores `severity` and paging. It supplies the stat tiles, the counts on the severity filter, and how many rows exist in total.
+- `date` in the response is null when the request was for a month or a state.
+- Order: newest day first, then fatal before non-fatal, then newest `id`.
 
-**Validated against real data, real network, real API — not mocked:**
-- `fetch_articles()` against the live Google News RSS endpoint.
-- `resolve_url()` via `googlenewsdecoder` against real Google redirect links.
-- `get_article_text()` via `trafilatura` against real publisher pages.
-- `extract_fields()` against the real OpenAI API, including on two deliberately-chosen edge cases:
-  - A same-day fresh accident (Agra, UP car crash) → correctly returned `is_india_traffic_accident: true, is_recent_accident: true, fatality: "Yes (3 dead)", vehicle_type: "Car", state: "Uttar Pradesh"`.
-  - A 2018 accident resurfacing via a tribunal compensation ruling → correctly returned `is_india_traffic_accident: true, is_recent_accident: false, fatality: "Yes (1 dead)", vehicle_type: "Two-wheeler", state: "Maharashtra"`.
-- Confirmed live that `gl=IN`/`ceid=IN:en` do **not** reliably filter to India-only content (see §3).
+A bad parameter (malformed month, both `date` and `month`, an unrecognised state, a limit out of range) returns 422.
 
-**Not yet built — this is the actual remaining work:**
-- The dedup/insert function described in §7 (currently only designed, not coded).
-- The Postgres schema in §8 (designed, not yet created on an actual Render Postgres instance).
-- The FastAPI backend: needs at minimum
-  - `GET /articles?date=YYYY-MM-DD` → returns rows for that date.
-  - An endpoint (or a parameter default) to get the **most recent date with data**, e.g. `SELECT DISTINCT date FROM articles ORDER BY date DESC LIMIT 1`, so the frontend can default to it on first load.
-- The Next.js dashboard frontend: date picker + table with the 5 columns from §1, defaulting to the most-recent-date-with-data view on load.
-- The daily cron job on Render that strings together fetch → enrich → extract → filter → dedup/insert, end to end, on a schedule.
-- Deployment config/secrets: `OPENAI_API_KEY` on Render, Postgres connection string, Vercel env var pointing the frontend at the Render API URL.
+### Frontend
 
-## 11. Known edge cases / design decisions log (for context, not action items)
+`frontend/` is a Next.js 16 app (React 19, Tailwind 4) with one page and three views. The view and everything selected in it live in the URL, so any view can be linked to and the back button works.
 
-- **Published date vs. occurrence date**: deliberately using published date for the `date` column, to avoid a late-reported accident silently populating an already-viewed past date.
-- **Dashboard default view**: most recent date *with data*, not strictly "today" — avoids an empty table before the daily cron has run.
-- **Table columns**: exactly Title / Fatality / Vehicle type / State / Article link, Title first. An `injury_count` field was considered and explicitly rejected — fatality only.
-- **Multi-accident-per-article**: known gap, accepted as-is for now (see §5).
-- **India-accident criteria**: based on where the accident **occurred**, not the nationality of people involved.
+| URL | View |
+|---|---|
+| `/` | Overview: latest day's totals, accidents over time, and the state map, for the latest month |
+| `/?month=2026-09` | Overview for another month |
+| `/?scope=day&day=2026-10-07` | Overview with the state map narrowed to one day |
+| `/?scope=all` | Overview with the state map over all time |
+| `/?date=2026-10-07` | Day view: that day's totals, a strip to jump to another day, and its articles |
+| `/?state=Goa` plus the same `month` / `scope` / `day` | State view: that state's totals and articles for the chosen period |
+| `&severity=fatal` or `non-fatal` | Narrows the article list in the day and state views |
+
+How it is put together:
+
+- **Data is fetched on the server** (`lib/api.ts`, using `API_URL`). The browser never calls the API. The first request is allowed 90 seconds, because Render's free tier sleeps when idle; `app/error.tsx` shows a retry message if it still fails.
+- **`/stats/daily` is fetched on every view.** Month totals, day-on-day changes, the month and day pickers and previous/next day are all derived from it (`lib/dates.ts`).
+- **Things that change the data are links** (month, period, day, state, severity). Things that only change how loaded data is shown are browser state: the Accidents/Deaths toggle, the selected state, "show all", and the hover note on the chart.
+- **Files:** `app/page.tsx` picks the view; `overview.tsx`, `day-view.tsx` and `state-view.tsx` are the views; `time-chart.tsx`, `state-map.tsx` and `article-table.tsx` are the interactive parts; `ui.tsx` holds shared pieces; `lib/urls.ts` defines the URL scheme; `lib/india-map.ts` holds the map outlines taken from the mockup.
+
+Differences from the mockup:
+
+- **Two severities, not three.** Bars, legend and filter have fatal and non-fatal only.
+- **The "Today" card is labelled "Latest"**, since it shows the latest day with data, which is not always today. It also has a direct link to that day's articles.
+- **The fatality pill** reads "Fatal · 3 dead", "Fatal · toll unknown", "Non-fatal · 5 injured" or "Non-fatal".
+- **A list longer than 500 articles** shows only the newest 500 and says so. Only a state's all-time list can get that long.
+- **The footnote under the map** gives the real number of accidents left out for having no known state.
+
+## 11. Tests
+
+Run from `backend/`.
+
+| Command | What runs |
+|---|---|
+| `pytest` | 124 tests, about 2 seconds, no LLM calls. Needs a local Postgres database named `accident_news_test` (or `TEST_DATABASE_URL`) |
+| `pytest -m llm` | 29 live tests through the real prompt, about 50 seconds. Needs `OPENAI_API_KEY`; costs well under a cent |
+
+The live tests (`tests/test_extract_llm.py`) check that the LLM maps wording to the fixed fields: one case per vehicle hint, multi-vehicle cases, things outside the list, and the severity and count combinations. They are excluded from a plain `pytest` by `pytest.ini`. The model isn't deterministic, so a one-off failure can be noise; a case that fails repeatedly means the prompt needs another hint.
+
+## 12. Running and deploying
+
+**Local.** Copy `backend/.env.example` to `backend/.env` and set `OPENAI_API_KEY`, `DATABASE_URL` and `CORS_ORIGINS`. Then, from `backend/`:
+
+```
+python run_pipeline.py --dry-run --limit 10   # try the pipeline without writing
+python run_pipeline.py                        # a real run
+uvicorn api:app                               # the API on :8000
+```
+
+From `frontend/`, set `API_URL` (see `.env.example`) and run `npm run dev`.
+
+**Deployed.** `render.yaml` defines the Postgres database, the API web service and the cron job (`python run_pipeline.py` at 18:00 UTC). Secrets set by hand on Render: `OPENAI_API_KEY` on the cron job, `CORS_ORIGINS` on the API. The frontend deploys to Vercel with root directory `frontend/` and `API_URL` pointing at the Render API.
+
+**Environment gotchas:**
+
+- `googlenewsdecoder` and `trafilatura` need unrestricted outbound network access.
+- `load_dotenv()` does not override a variable already exported in the shell, so a stale exported key wins over `.env`.
+- Render's free Postgres expires 30 days after creation.
+
+## 13. Design decisions
+
+- **Published date, not accident date.** `date` is the article's published date in Indian time. Using the accident date would let a late report change a day that has already been viewed. The dashboard's "today" therefore means "reported today".
+- **Default view is the latest day with data**, not the calendar day, so the page is never empty before the cron has run.
+- **Two severities, no "unknown".** An article that doesn't say whether anyone died is stored as non-fatal. Simpler everywhere, at the cost of a slight undercount of fatal accidents (about 5% of articles were unclear when this was decided).
+- **0 means "not stated" for the counts.** No NULLs to handle. Death and injury totals are therefore lower bounds.
+- **A fixed vehicle list instead of free text.** Free text produced 89 distinct descriptions in 466 rows, which made counting by vehicle impossible and weakened dedup. Pedestrians and anything outside the seven categories are not recorded.
+- **`vehicles` is an array column**, not two columns or a link table. It handles any number of vehicles and keeps "accidents involving a bus" a one-line filter.
+- **One row per accident, one link per row.** A second outlet's report is discarded, not merged in. (An earlier design kept extra outlets in a `sources` column; that was dropped.)
+- **No publish time is stored.** Articles within a day are ordered by `id`.
+- **"India accident" means where it happened**, not the nationality of the people involved.
+
+## 14. Known gaps
+
+- **Duplicates inflate the totals.** The same accident is sometimes stored more than once (in the 1–7 October data, one Ramban bus accident appears under several outlets). Death and injury totals count each copy. See §9 for why the same-event check misses these.
+
+- **Several accidents in one article.** One article yields one row; a report that bundles two accidents is not split.
+- **Injury counts for 1–7 October 2026** came from headlines only, so they are an undercount (147 of 466 articles have one).
+- **Occurrence date is not extracted.** Charts by the day an accident happened would need a new LLM field.
