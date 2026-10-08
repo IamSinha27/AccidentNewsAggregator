@@ -1,0 +1,10 @@
+feedparser==6.0.14
+googlenewsdecoder==0.2.1
+trafilatura==2.2.0
+openai==3.23.0
+python-dotenv==1.2.4
+psycopg[binary]==3.3.6
+fastapi==0.142.2
+uvicorn==0.54.0
+pytest==9.1.1
+httpx==0.28.1
