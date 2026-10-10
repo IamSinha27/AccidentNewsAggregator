@@ -177,7 +177,7 @@ def test_state_stats_december_does_not_spill_into_january(client, conn):
     assert body["states"][0]["accidents"] == 1
 
 
-@pytest.mark.parametrize("path", ["/stats/states", "/articles"])
+@pytest.mark.parametrize("path", ["/stats/states", "/stats/vehicles", "/articles"])
 @pytest.mark.parametrize("params", [
     {"date": "2026-10-01", "month": "2026-10"},
     {"month": "2026-13"},
@@ -186,6 +186,102 @@ def test_state_stats_december_does_not_spill_into_january(client, conn):
 ])
 def test_bad_scope_is_rejected(client, path, params):
     assert client.get(path, params=params).status_code == 422
+
+
+# --- /articles by vehicle -------------------------------------------------
+
+def test_articles_for_a_vehicle_alone_cover_all_time(client, spread):
+    body = client.get("/articles", params={"vehicle": "Bus"}).json()
+    assert body["date"] is None
+    assert titles(body) == ["Accident 4"]
+    assert body["totals"] == totals(1, 1, 0, 5, 0)
+
+
+def test_articles_for_a_vehicle_and_state(client, spread):
+    body = client.get("/articles", params={"vehicle": "Car", "state": "Bihar"}).json()
+    assert titles(body) == ["Accident 2", "Accident 1"]
+    assert body["totals"] == totals(2, 1, 1, 2, 5)
+
+
+def test_articles_for_a_vehicle_and_month(client, spread):
+    body = client.get("/articles", params={"vehicle": "Car", "month": "2026-10"}).json()
+    assert titles(body) == ["Accident 6", "Accident 3", "Accident 2"]
+    assert body["totals"] == totals(3, 2, 1, 1, 7)
+
+
+def test_severity_narrows_a_vehicle_list_but_not_its_totals(client, spread):
+    body = client.get("/articles", params={"vehicle": "Car", "severity": "fatal"}).json()
+    assert titles(body) == ["Accident 6", "Accident 3", "Accident 1"]
+    assert body["totals"] == totals(4, 3, 1, 3, 8)
+
+
+def test_a_multi_vehicle_accident_is_listed_under_each_vehicle(client, conn):
+    add(conn, OCT_1, "https://example.com/multi", state="Bihar", vehicles=["Car", "Truck"], title="Car meets truck")
+    conn.commit()
+    for vehicle in ("Car", "Truck"):
+        assert titles(client.get("/articles", params={"vehicle": vehicle}).json()) == ["Car meets truck"]
+
+
+def test_articles_reject_an_unknown_vehicle(client, spread):
+    assert client.get("/articles", params={"vehicle": "Spaceship"}).status_code == 422
+
+
+# --- /stats/vehicles ------------------------------------------------------
+
+def test_vehicle_stats_for_all_time_rank_vehicles(client, spread):
+    assert client.get("/stats/vehicles").json() == {
+        "date": None,
+        "month": None,
+        "state": None,
+        "vehicles": [
+            {"vehicle": "Car", **totals(4, 3, 1, 3, 8)},
+            # equal counts fall back to alphabetical order
+            {"vehicle": "Bus", **totals(1, 1, 0, 5, 0)},
+            {"vehicle": "Truck", **totals(1, 0, 1, 0, 2)},
+        ],
+        "unknown": ZERO,
+    }
+
+
+def test_vehicle_stats_for_a_month_and_state(client, spread):
+    body = client.get("/stats/vehicles", params={"month": "2026-10", "state": "Bihar"}).json()
+    assert body["month"] == "2026-10"
+    assert body["state"] == "Bihar"
+    assert body["vehicles"] == [
+        {"vehicle": "Bus", **totals(1, 1, 0, 5, 0)},
+        {"vehicle": "Car", **totals(1, 0, 1, 0, 4)},
+        {"vehicle": "Truck", **totals(1, 0, 1, 0, 2)},
+    ]
+
+
+def test_vehicle_stats_for_a_day(client, spread):
+    body = client.get("/stats/vehicles", params={"date": "2026-10-02"}).json()
+    assert body["date"] == "2026-10-02"
+    assert [v["vehicle"] for v in body["vehicles"]] == ["Bus", "Car", "Truck"]
+
+
+def test_vehicle_stats_count_a_multi_vehicle_accident_under_each_vehicle(client, conn):
+    add(conn, OCT_1, "https://example.com/multi", state="Bihar", vehicles=["Car", "Truck"])
+    conn.commit()
+    body = client.get("/stats/vehicles").json()
+    assert {v["vehicle"]: v["accidents"] for v in body["vehicles"]} == {"Car": 1, "Truck": 1}
+
+
+def test_vehicle_stats_set_accidents_with_no_vehicle_aside(client, conn):
+    add(conn, OCT_1, "https://example.com/none", state="Goa", vehicles=[], severity="non-fatal", deaths=0, injured=3)
+    add(conn, OCT_1, "https://example.com/car", state="Bihar", vehicles=["Car"])
+    conn.commit()
+    body = client.get("/stats/vehicles").json()
+    assert [v["vehicle"] for v in body["vehicles"]] == ["Car"]
+    assert body["unknown"] == totals(1, 0, 1, 0, 3)
+
+
+def test_vehicle_stats_with_no_data_are_empty(client):
+    assert client.get("/stats/vehicles").json() == {"date": None, "month": None, "state": None, "vehicles": [], "unknown": ZERO}
+
+
+def test_vehicle_stats_reject_an_unknown_state(client, spread):
+    assert client.get("/stats/vehicles", params={"state": "Atlantis"}).status_code == 422
 
 
 # --- /articles filters ----------------------------------------------------

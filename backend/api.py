@@ -7,8 +7,9 @@ from /cron/fetch, which runs the pipeline for hosts that trigger it by URL.
 
 GET /stats/daily    totals for every day that has data, oldest first
 GET /stats/states   totals per state for a day (?date=), a month (?month=) or all time
+GET /stats/vehicles totals per vehicle type for a day, a month or all time, optionally one ?state=
 GET /articles       article list + totals for a day, a month and/or a state
-                    (default: latest day with data); ?severity= ?limit= ?offset=
+                    (default: latest day with data); ?vehicle= ?severity= ?limit= ?offset=
 GET /dates          days that have data, newest first (superseded by /stats/daily)
 GET /health
 GET /cron/fetch     run one fetch; needs "Authorization: Bearer $CRON_SECRET"
@@ -27,7 +28,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import db
-from extract import INDIAN_STATES_UTS
+from extract import INDIAN_STATES_UTS, VEHICLE_TYPES
 
 STATES = set(INDIAN_STATES_UTS) | {"Unknown"}
 
@@ -98,13 +99,16 @@ def dates(conn: psycopg.Connection = Depends(get_conn)):
     return {"dates": [row[0] for row in rows]}
 
 
-def _scope(day: Optional[datetime.date], month: Optional[str], state: Optional[str] = None):
+def _scope(day: Optional[datetime.date], month: Optional[str], state: Optional[str] = None, vehicle: Optional[str] = None):
     """WHERE clause and its parameters for a day or a month, optionally
-    narrowed to one state. With nothing given it is empty: all time."""
+    narrowed to one state and/or one vehicle type. With nothing given it is
+    empty: all time."""
     if day and month:
         raise HTTPException(422, "give either date or month, not both")
     if state is not None and state not in STATES:
         raise HTTPException(422, f"unknown state: {state}")
+    if vehicle is not None and vehicle not in VEHICLE_TYPES:
+        raise HTTPException(422, f"unknown vehicle: {vehicle}")
     clauses, params = [], []
     if day:
         clauses.append("date = %s")
@@ -118,6 +122,9 @@ def _scope(day: Optional[datetime.date], month: Optional[str], state: Optional[s
     if state is not None:
         clauses.append("state = %s")
         params.append(state)
+    if vehicle is not None:
+        clauses.append("%s = ANY(vehicles)")
+        params.append(vehicle)
     return ("WHERE " + " AND ".join(clauses) if clauses else ""), params
 
 
@@ -158,20 +165,53 @@ def stats_states(
     return {"date": day, "month": month, "states": states, "unknown": unknown}
 
 
+@app.get("/stats/vehicles")
+def stats_vehicles(
+    day: Optional[datetime.date] = DATE_PARAM,
+    month: Optional[str] = MONTH_PARAM,
+    state: Optional[str] = Query(None, description="a state/UT name, or Unknown"),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    """Totals per vehicle type for a day, a month or all time, optionally for
+    one state. An accident that involves several vehicles counts under each of
+    them, so the rows add up to more than the accident total. Accidents with
+    no vehicle named are reported on their own."""
+    where, params = _scope(day, month, state)
+    rows = conn.execute(
+        f"""
+        SELECT vehicle, {TOTALS_SQL}
+        FROM articles, unnest(vehicles) AS vehicle {where}
+        GROUP BY vehicle
+        ORDER BY count(*) DESC, vehicle
+        """,
+        params,
+    ).fetchall()
+    no_vehicle = where + (" AND " if where else "WHERE ") + "cardinality(vehicles) = 0"
+    unknown = conn.execute(f"SELECT {TOTALS_SQL} FROM articles {no_vehicle}", params).fetchone()
+    return {
+        "date": day,
+        "month": month,
+        "state": state,
+        "vehicles": [{"vehicle": row[0], **_totals(row[1:])} for row in rows],
+        "unknown": _totals(unknown),
+    }
+
+
 @app.get("/articles")
 def articles(
     day: Optional[datetime.date] = Query(None, alias="date", description="YYYY-MM-DD; with no date, month or state: the latest day with data"),
     month: Optional[str] = MONTH_PARAM,
     state: Optional[str] = Query(None, description="a state/UT name, or Unknown; alone it means all time for that state"),
+    vehicle: Optional[str] = Query(None, description="a vehicle type; an accident with several vehicles is listed under each"),
     severity: Optional[Literal["fatal", "non-fatal"]] = Query(None, description="narrows the list, not the totals"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     conn: psycopg.Connection = Depends(get_conn),
 ):
     latest = _latest_date(conn)
-    if day is None and month is None and state is None:
+    if day is None and month is None and state is None and vehicle is None:
         day = latest
-    where, params = _scope(day, month, state)
+    where, params = _scope(day, month, state, vehicle)
 
     totals = _totals(conn.execute(f"SELECT {TOTALS_SQL} FROM articles {where}", params).fetchone())
     if severity:
