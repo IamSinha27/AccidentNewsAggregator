@@ -110,7 +110,7 @@ export function TimeChart({ months, scope }: { months: Month[]; scope: Scope }) 
             return (
               <Link
                 key={m.key}
-                href={overviewHref({ kind: scope.kind, month: m.key, day: m.days[m.days.length - 1].date })}
+                href={overviewHref({ ...scope, month: m.key, day: m.days[m.days.length - 1].date })}
                 scroll={false}
                 aria-label={`${monthName(m.key)}: ${m.totals.accidents} accidents`}
                 aria-current={on ? "true" : undefined}

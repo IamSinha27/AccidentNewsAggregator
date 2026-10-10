@@ -1,15 +1,19 @@
 import Link from "next/link";
 
-import { type DailyStats, type Severity, fetchArticles } from "@/lib/api";
+import { type DailyStats, type Severity, fetchArticles, fetchVehicles } from "@/lib/api";
 import { count, groupMonths } from "@/lib/dates";
-import { type Scope, overviewHref, scopeLabel, scopePeriod, stateHref } from "@/lib/urls";
+import { type Scope, overviewHref, scopeLabel, scopePeriod, stateHref, vehicleHref } from "@/lib/urls";
 import { ArticleTable } from "./article-table";
 import { StatTiles, ghostButton, kicker, panel } from "./ui";
+import { VehicleChart } from "./vehicle-chart";
 
 /** One state's articles and totals, for the day, month or all-time period chosen on the map. */
 export async function StateView({ daily, state, scope, severity }: { daily: DailyStats; state: string; scope: Scope; severity?: Severity }) {
   const span = scopeLabel(scope, groupMonths(daily.days));
-  const { totals, articles } = await fetchArticles({ state, ...scopePeriod(scope), severity });
+  const [{ totals, articles }, vehicles] = await Promise.all([
+    fetchArticles({ state, ...scopePeriod(scope), severity }),
+    fetchVehicles({ state, ...scopePeriod(scope) }),
+  ]);
 
   return (
     <>
@@ -30,6 +34,8 @@ export async function StateView({ daily, state, scope, severity }: { daily: Dail
       <section className={`${panel} overflow-hidden`}>
         <StatTiles totals={totals} countLabel="Articles" note={() => span} />
       </section>
+
+      <VehicleChart stats={vehicles} scopeNote={span} hrefFor={(vehicle) => vehicleHref(vehicle, scope, state)} />
 
       <ArticleTable
         key={severity ?? "all"}

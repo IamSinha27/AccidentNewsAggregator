@@ -82,7 +82,7 @@ export function StateMap({
               <select
                 className={selectClass}
                 value={scope.month}
-                onChange={(event) => go({ kind: scope.kind, month: event.target.value, day: lastDayOf(event.target.value) })}
+                onChange={(event) => go({ ...scope, month: event.target.value, day: lastDayOf(event.target.value) })}
               >
                 {months.map((m) => (
                   <option key={m.key} value={m.key}>

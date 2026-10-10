@@ -30,6 +30,15 @@ export type StateStats = {
   unknown: Totals;
 };
 
+export type VehicleTotals = Totals & { vehicle: string };
+
+export type VehicleStats = {
+  /** Vehicle types in at least one accident, most accidents first. An accident with several vehicles counts under each. */
+  vehicles: VehicleTotals[];
+  /** Accidents that name no vehicle. */
+  unknown: Totals;
+};
+
 export type Severity = "fatal" | "non-fatal";
 
 export type Article = {
@@ -86,7 +95,12 @@ export function fetchStates(period: Period): Promise<StateStats> {
   return get("/stats/states", period);
 }
 
-/** Articles for a day, a month and/or a state, newest first. */
-export function fetchArticles(filter: Period & { state?: string; severity?: Severity }): Promise<ArticlesResponse> {
+/** Totals per vehicle type for a day, a month or all time, optionally for one state. */
+export function fetchVehicles(filter: Period & { state?: string }): Promise<VehicleStats> {
+  return get("/stats/vehicles", filter);
+}
+
+/** Articles for a day, a month, a state and/or a vehicle type, newest first. */
+export function fetchArticles(filter: Period & { state?: string; vehicle?: string; severity?: Severity }): Promise<ArticlesResponse> {
   return get("/articles", { ...filter, limit: String(ARTICLE_LIMIT) });
 }

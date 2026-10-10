@@ -1,17 +1,22 @@
 import Link from "next/link";
 
-import { type DailyStats, type Totals, fetchStates } from "@/lib/api";
+import { type DailyStats, type Totals, fetchStates, fetchVehicles } from "@/lib/api";
 import { count, groupMonths, isNextDay, longDay, monthName } from "@/lib/dates";
-import { type Scope, overviewHref, scopeLabel, scopePeriod } from "@/lib/urls";
+import { type Scope, overviewHref, scopeLabel, scopePeriod, vehicleHref, vehicleWindow } from "@/lib/urls";
 import { StateMap } from "./state-map";
 import { TimeChart } from "./time-chart";
 import { Legend, StatTiles, change, ghostButton, panel } from "./ui";
+import { VehicleChart } from "./vehicle-chart";
+import { VehiclePeriod } from "./vehicle-period";
 
-/** The landing view: the latest day, accidents over time, and the state map. */
+/** The landing view: the latest day, accidents over time, the vehicle chart and the state map (each with its own period). */
 export async function Overview({ daily, scope }: { daily: DailyStats; scope: Scope }) {
   const months = groupMonths(daily.days);
   const month = months.find((m) => m.key === scope.month)!;
-  const { states, unknown } = await fetchStates(scopePeriod(scope));
+  // The vehicle chart has a period of its own, set apart from the state map's.
+  const vehicleScope = vehicleWindow(scope, months);
+  const vehicleMonth = months.find((m) => m.key === vehicleScope.month)!;
+  const [{ states, unknown }, vehicles] = await Promise.all([fetchStates(scopePeriod(scope)), fetchVehicles(scopePeriod(vehicleScope))]);
 
   const today = daily.days[daily.days.length - 1];
   const before = daily.days[daily.days.length - 2];
@@ -63,6 +68,21 @@ export async function Overview({ daily, scope }: { daily: DailyStats; scope: Sco
         </div>
         <TimeChart months={months} scope={scope} />
       </section>
+
+      <VehicleChart
+        stats={vehicles}
+        scopeNote={scopeLabel(vehicleScope, months)}
+        // Opened from here, the list keeps this chart's period, and "← Overview" brings both sections back as they were.
+        hrefFor={(vehicle) => vehicleHref(vehicle, { ...scope, vehicles: vehicleScope })}
+        control={
+          <VehiclePeriod
+            scope={scope}
+            window={vehicleScope}
+            months={months.map((m) => ({ key: m.key, lastDay: m.days[m.days.length - 1].date }))}
+            days={vehicleMonth.days.map((d) => d.date)}
+          />
+        }
+      />
 
       <StateMap
         states={states}

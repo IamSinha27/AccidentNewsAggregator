@@ -4,10 +4,11 @@ import { Suspense } from "react";
 import { fetchDaily } from "@/lib/api";
 import { groupMonths, parseDay } from "@/lib/dates";
 import { MAP_CENTROIDS } from "@/lib/india-map";
-import { oneParam, parseSeverity, resolveScope } from "@/lib/urls";
+import { oneParam, parseSeverity, parseVehicle, resolveScope } from "@/lib/urls";
 import { DayView } from "./day-view";
 import { Overview } from "./overview";
 import { StateView } from "./state-view";
+import { VehicleView } from "./vehicle-view";
 import { Notice, linkClass, panel } from "./ui";
 
 type Params = Record<string, string | string[] | undefined>;
@@ -16,6 +17,7 @@ type Params = Record<string, string | string[] | undefined>;
 async function View({ params }: { params: Params }) {
   const date = parseDay(params.date);
   const state = oneParam(params.state);
+  const vehicle = parseVehicle(params.vehicle);
   const severity = parseSeverity(params.severity);
   const daily = await fetchDaily();
   if (daily.days.length === 0) {
@@ -34,6 +36,18 @@ async function View({ params }: { params: Params }) {
       </Notice>
     );
   }
+  if (oneParam(params.vehicle) && !vehicle) {
+    return (
+      <Notice title={`“${oneParam(params.vehicle)}” isn’t a vehicle type we track`}>
+        Go back to the{" "}
+        <Link href="/" className={linkClass}>
+          overview
+        </Link>{" "}
+        and pick one from the vehicle chart.
+      </Notice>
+    );
+  }
+  if (vehicle) return <VehicleView daily={daily} vehicle={vehicle} state={state} scope={scope} severity={severity} />;
   if (state) return <StateView daily={daily} state={state} scope={scope} severity={severity} />;
   return <Overview daily={daily} scope={scope} />;
 }
@@ -55,7 +69,7 @@ export default async function Home(props: PageProps<"/">) {
   const params = await props.searchParams;
   // Keyed by view only: moving between days or periods keeps the current
   // page on screen until the next one is ready, instead of flashing a skeleton.
-  const view = parseDay(params.date) ? "day" : oneParam(params.state) ? "state" : "overview";
+  const view = parseDay(params.date) ? "day" : oneParam(params.vehicle) ? "vehicle" : oneParam(params.state) ? "state" : "overview";
 
   return (
     <main className="mx-auto flex w-full max-w-[1200px] flex-1 flex-col gap-6 px-[clamp(16px,5vw,56px)] pt-[clamp(20px,5vw,56px)] pb-14">
