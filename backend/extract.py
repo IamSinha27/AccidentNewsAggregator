@@ -130,6 +130,7 @@ def extract_fields(title: str, snippet: str = "", body_text: Optional[str] = Non
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=400,
+            temperature=0,
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:
